@@ -1,7 +1,7 @@
 import { Hono, type Context } from 'hono'
 import { HTTPException } from 'hono/http-exception'
 import type { AppEnv } from './auth'
-import { assertMember, PERSONAL_TASK_COLUMNS, STATUS, TEAM_TASK_COLUMNS, toTask, type TaskRow } from './tabs'
+import { assertMember, iso, PERSONAL_TASK_COLUMNS, STATUS, type TaskRow, TEAM_TASK_COLUMNS, toTask } from './tabs'
 
 /** The app sends the Dart enum name; the database holds the snake_case value. */
 const DB_STATUS: Record<string, string> = Object.fromEntries(Object.entries(STATUS).map(([db, app]) => [app, db]))
@@ -106,9 +106,9 @@ const tabOf = (t: TeamTask) =>
 
 /** A team task in one of the viewer's tabs: 404 if missing, 403 if outside them. */
 async function teamTask(c: Context<AppEnv>) {
-  const task = await c.env.DB.prepare('select division_id, project_id, assignee_id, status, required_proof_type from tasks where id = ?')
+  const task = await c.env.DB.prepare('select division_id, project_id, assignee_id, creator_id, status, required_proof_type from tasks where id = ?')
     .bind(c.req.param('id'))
-    .first<TeamTask & { status: string; required_proof_type: string | null }>()
+    .first<TeamTask & { creator_id: number; status: string; required_proof_type: string | null }>()
   if (!task) throw new HTTPException(404, { message: 'No such task' })
   const tab = tabOf(task)
   await assertMember(c.env.DB, tab.kind, tab.id, c.get('user').id)
@@ -285,4 +285,75 @@ tasks.patch('/personal-tasks/:id{[0-9]+}/status', async (c) => {
     .first<TaskRow>()
   if (!row) throw await goneOrChanged(c.env.DB, 'personal_tasks', c.req.param('id'))
   return c.json(toTask(row))
+})
+
+/**
+ * Who reviews a task (arcbyte decision 0004): in a project, its
+ * person-in-charge or its author; in a division only, its admin or supervisor.
+ * A reviewer may review their own task.
+ */
+export async function isReviewer(db: D1Database, task: TeamTask, userId: number) {
+  const tab = tabOf(task)
+  const sql =
+    tab.kind === 'project'
+      ? `select 1 from projects p where p.id = ?1 and (p.creator_id = ?2 or exists (select 1 from project_members m
+           where m.project_id = p.id and m.user_id = ?2 and m.role = 'person-in-charge'))`
+      : `select 1 from division_members where division_id = ?1 and user_id = ?2 and role_type in ('admin', 'supervisor')`
+  return !!(await db.prepare(sql).bind(tab.id, userId).first())
+}
+
+tasks.get('/tasks/:id{[0-9]+}/detail', async (c) => {
+  const me = c.get('user').id
+  const task = await teamTask(c)
+  const tab = tabOf(task)
+  const [tabRow, subtasks, comments, assignee, reviewer] = await Promise.all([
+    c.env.DB.prepare(`select name from ${tab.kind === 'project' ? 'projects' : 'divisions'} where id = ?`).bind(tab.id).first<string>('name'),
+    c.env.DB.prepare(`select ${TEAM_TASK_COLUMNS} from tasks where parent_id = ? order by created_at, id`).bind(c.req.param('id')).all<TaskRow>(),
+    c.env.DB.prepare(
+      `select u.id, u.name, c.comment body, c.created_at from comments c join users u on u.id = c.user_id
+       where c.task_id = ? and c.deleted_at is null order by c.created_at, c.id`,
+    )
+      .bind(c.req.param('id'))
+      .all<{ id: number; name: string; body: string; created_at: string }>(),
+    task.assignee_id === null ? null : c.env.DB.prepare('select id, name from users where id = ?').bind(task.assignee_id).first(),
+    isReviewer(c.env.DB, task, me),
+  ])
+  return c.json({
+    tab: { kind: tab.kind, id: tab.id, name: tabRow },
+    subtasks: subtasks.results.map(toTask),
+    comments: comments.results.map((r) => ({ author: { id: r.id, name: r.name }, body: r.body, createdAt: iso(r.created_at) })),
+    assignee,
+    canReview: task.status === 'review' && reviewer,
+    canArchive: task.creator_id === me,
+    canRequestExtension: task.assignee_id === me && !reviewer,
+  })
+})
+
+tasks.get('/personal-tasks/:id{[0-9]+}/detail', async (c) => {
+  await assertOwnPersonalTask(c)
+  const { results } = await c.env.DB.prepare(`select ${PERSONAL_TASK_COLUMNS} from personal_tasks where parent_id = ? order by created_at, id`)
+    .bind(c.req.param('id'))
+    .all<TaskRow>()
+  return c.json({
+    tab: { kind: 'private', id: 0, name: 'private' },
+    subtasks: results.map(toTask),
+    comments: [],
+    assignee: null,
+    canReview: false,
+    canArchive: false,
+    canRequestExtension: false,
+  })
+})
+
+tasks.post('/tasks/:id{[0-9]+}/comments', async (c) => {
+  await teamTask(c)
+  const { body } = await c.req.json<{ body?: unknown }>().catch(() => ({}) as { body?: unknown })
+  if (typeof body !== 'string' || !body.trim()) throw bad('body must be a non-empty string')
+  const user = c.get('user')
+  const createdAt = await c.env.DB.prepare(
+    `insert into comments (task_id, user_id, comment, created_at, updated_at) values (?, ?, ?, datetime('now'), datetime('now')) returning created_at`,
+  )
+    .bind(c.req.param('id'), user.id, body.trim())
+    .first<string>('created_at')
+  return c.json({ author: { id: user.id, name: user.name }, body: body.trim(), createdAt: iso(createdAt!) }, 201)
 })

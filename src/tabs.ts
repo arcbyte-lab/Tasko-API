@@ -7,7 +7,7 @@ export type Kind = 'private' | 'division' | 'project'
 export const STATUS: Record<string, string> = { todo: 'todo', waiting: 'waiting', in_progress: 'inProgress', review: 'review', done: 'done' }
 
 /** D1 stores UTC as `YYYY-MM-DD HH:MM:SS`; the app wants ISO 8601. A bare date is midnight UTC. */
-const iso = (d: string | null) => {
+export const iso = (d: string | null) => {
   if (!d) return null
   const s = d.replace(' ', 'T')
   if (!s.includes('T')) return `${s}T00:00:00Z`
