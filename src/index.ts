@@ -1,6 +1,7 @@
 import { Hono } from 'hono'
 import { auth, requireUser, type AppEnv } from './auth'
 import { tabs } from './tabs'
+import { tasks } from './tasks'
 
 const app = new Hono<AppEnv>()
 
@@ -11,5 +12,6 @@ app.use('*', requireUser)
 
 app.get('/me', (c) => c.json(c.get('user')))
 app.route('/tabs', tabs)
+app.route('/', tasks)
 
 export default app

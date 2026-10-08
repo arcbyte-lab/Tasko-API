@@ -2,7 +2,7 @@ import { Hono } from 'hono'
 import { HTTPException } from 'hono/http-exception'
 import type { AppEnv } from './auth'
 
-type Kind = 'private' | 'division' | 'project'
+export type Kind = 'private' | 'division' | 'project'
 
 const STATUS: Record<string, string> = { todo: 'todo', waiting: 'waiting', in_progress: 'inProgress', review: 'review', done: 'done' }
 const PRIORITY = ['low', 'medium', 'high', 'urgent']
@@ -59,7 +59,7 @@ const VISIBLE_PROJECT = `p.status != 'archived'
   and exists (select 1 from project_members m where m.project_id = p.id and m.user_id = ?1)` // membership is the member tables alone (0002)
 
 /** Throws 403 unless the viewer can see the division or project; the private tab is only id 0. */
-async function assertMember(db: D1Database, kind: Kind, id: number, userId: number) {
+export async function assertMember(db: D1Database, kind: Kind, id: number, userId: number) {
   if (kind === 'private') {
     if (id !== 0) throw new HTTPException(404, { message: 'The private tab is 0' })
     return
