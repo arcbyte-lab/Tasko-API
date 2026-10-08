@@ -5,7 +5,6 @@ import type { AppEnv } from './auth'
 export type Kind = 'private' | 'division' | 'project'
 
 export const STATUS: Record<string, string> = { todo: 'todo', waiting: 'waiting', in_progress: 'inProgress', review: 'review', done: 'done' }
-const PRIORITY = ['low', 'medium', 'high', 'urgent']
 
 /** D1 stores UTC as `YYYY-MM-DD HH:MM:SS`; the app wants ISO 8601. A bare date is midnight UTC. */
 const iso = (d: string | null) => {
@@ -35,7 +34,7 @@ export const toTask = (r: TaskRow) => ({
   id: r.id,
   name: r.name,
   status: STATUS[r.status],
-  priority: PRIORITY[Math.min(Math.max(r.priority_level, 1), 4) - 1],
+  priority: r.priority_level,
   dueDate: iso(r.due_date),
   description: r.description,
   assigneeId: r.assignee_id,
@@ -100,18 +99,23 @@ tabs.get('/:kind{private|division|project}/:id{[0-9]+}/tasks', async (c) => {
   return c.json(results.map(toTask))
 })
 
+/** Who a task in the tab can be assigned to: its active members, [viewer] first. */
+export async function membersOf(db: D1Database, kind: 'division' | 'project', id: number, viewer: number) {
+  const sql =
+    kind === 'division'
+      ? 'select u.id, u.name, m.role_type role from division_members m join users u on u.id = m.user_id where m.division_id = ?1 and u.is_active = 1'
+      : 'select u.id, u.name, m.role from project_members m join users u on u.id = m.user_id where m.project_id = ?1 and u.is_active = 1'
+  const { results } = await db.prepare(`${sql} order by u.id != ?2, u.id`)
+    .bind(id, viewer)
+    .all<{ id: number; name: string; role: string }>()
+  return results.map((m) => ({ user: { id: m.id, name: m.name }, role: m.role }))
+}
+
 tabs.get('/:kind{private|division|project}/:id{[0-9]+}/members', async (c) => {
   const kind = c.req.param('kind') as Kind
   const id = Number(c.req.param('id'))
   const me = c.get('user').id
   await assertMember(c.env.DB, kind, id, me)
   if (kind === 'private') return c.json([])
-  const sql =
-    kind === 'division'
-      ? 'select u.id, u.name, m.role_type role from division_members m join users u on u.id = m.user_id where m.division_id = ?1 and u.is_active = 1'
-      : 'select u.id, u.name, m.role from project_members m join users u on u.id = m.user_id where m.project_id = ?1 and u.is_active = 1'
-  const { results } = await c.env.DB.prepare(`${sql} order by u.id != ?2, u.id`)
-    .bind(id, me)
-    .all<{ id: number; name: string; role: string }>()
-  return c.json(results.map((m) => ({ user: { id: m.id, name: m.name }, role: m.role })))
+  return c.json(await membersOf(c.env.DB, kind, id, me))
 })
