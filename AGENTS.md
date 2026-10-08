@@ -57,3 +57,17 @@ a domain concept.
 Normal engineering rules apply here — tests, conventions, tooling — same as
 any code repo. Nothing in Arcbyte's `AGENTS.md` (lenses, `evidence:` fields,
 `status: draft`, etc.) is relevant on this side.
+
+## Agent skills
+
+### Issue tracker
+
+Issues live in this repo's GitHub Issues (`arcbyte-lab/Tasko-API`), via the `gh` CLI. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Default triage label vocabulary: `needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix`. See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+No local `CONTEXT.md`/`docs/adr/` — domain vocabulary, specs, and decisions live in the sibling Arcbyte repo, per the domain-model rule above. See `docs/agents/domain.md`.
