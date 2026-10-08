@@ -1,6 +1,9 @@
 ```txt
-npm install
-npm run dev
+bun install
+bun run db:migrate   # schema into the local D1
+bun run db:seed      # FakeTasksApi's world: Mira, Ana, tech, tasko-app, tasko-web
+bun run dev
+bun run test         # vitest in workerd, fresh seeded DB per test
 ```
 
 ```txt
