@@ -5,6 +5,7 @@ declare global {
     interface Env {
       TEST_MIGRATIONS: D1Migration[]
       TEST_SEED: string[]
+      TEST_CASES: string[]
     }
   }
 }

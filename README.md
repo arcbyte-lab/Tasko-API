@@ -1,7 +1,7 @@
 ```txt
 bun install
 bun run db:migrate   # schema into the local D1
-bun run db:seed      # FakeTasksApi's world: Mira, Ana, tech, tasko-app, tasko-web
+bun run db:seed      # FakeTasksApi's world, then seed/cases.sql: every role, visibility and status case
 bun run dev
 bun run test         # vitest in workerd, fresh seeded DB per test
 ```

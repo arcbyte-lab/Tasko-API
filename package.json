@@ -7,7 +7,7 @@
     "cf-typegen": "wrangler types --env-interface CloudflareBindings",
     "test": "vitest run",
     "db:migrate": "wrangler d1 migrations apply DB --local",
-    "db:seed": "wrangler d1 execute DB --local --file seed/seed.sql"
+    "db:seed": "wrangler d1 execute DB --local --file seed/seed.sql && wrangler d1 execute DB --local --file seed/cases.sql"
   },
   "dependencies": {
     "hono": "^4.13.13"
