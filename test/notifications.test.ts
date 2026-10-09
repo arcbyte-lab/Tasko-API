@@ -50,7 +50,7 @@ describe('producers', () => {
       env.DB.prepare('update tasks set assignee_id = 3 where id = 5'), // Budi's now
       env.DB.prepare('delete from project_members where project_id = 2 and user_id = 1'), // Mira, tasko-web's author, leaves
     ])
-    expect((await send('PATCH', '/tasks/5/status', { status: 'review' }, await login('budi@arcbyte.dev'))).status).toBe(200)
+    expect((await send('PATCH', '/tasks/5/status', { status: 'review', proofUrl: 'https://example.com/p' }, await login('budi@arcbyte.dev'))).status).toBe(200)
     expect((await rows()).map((r) => r.notifiable_id)).toEqual([2])
   })
 
