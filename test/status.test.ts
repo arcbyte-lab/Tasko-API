@@ -26,8 +26,14 @@ describe('personal tasks', () => {
     expect(task).toMatchObject({ status: 'todo', completedAt: null })
   })
 
+  it('todo → in progress: "start working" (0008)', async () => {
+    const task = (await (await tick('/personal-tasks/1', 'inProgress')).json()) as any
+    expect(task).toMatchObject({ status: 'inProgress', completedAt: null })
+  })
+
   it('anything else is 422', async () => {
-    expect((await tick('/personal-tasks/1', 'inProgress')).status).toBe(422)
+    expect((await tick('/personal-tasks/3', 'inProgress')).status, 'already in progress').toBe(422)
+    expect((await tick('/personal-tasks/6', 'inProgress')).status, 'done').toBe(422)
     expect((await tick('/personal-tasks/1', 'review')).status).toBe(422)
     expect((await tick('/personal-tasks/6', 'done')).status).toBe(422)
   })
@@ -67,6 +73,13 @@ describe('team tasks', () => {
     expect(await row('select count(*) n from proofs where task_id = 2')).toEqual({ n: 0 })
   })
 
+  it('waiting → in progress: "start working" (0008), setting start_date once', async () => {
+    const task = (await (await tick('/tasks/2', 'inProgress')).json()) as any
+    expect(task).toMatchObject({ id: 2, status: 'inProgress', completedAt: null })
+    expect((await row('select start_date from tasks where id = 2')).start_date).not.toBeNull()
+    expect((await tick('/tasks/7', 'inProgress')).status, 'only its assignee').toBe(403)
+  })
+
   it('done → waiting clears completed_date and review_date', async () => {
     await env.DB.prepare("update tasks set review_date = datetime('now') where id = 4").run()
     const task = (await (await tick('/tasks/4', 'waiting')).json()) as any
@@ -79,7 +92,8 @@ describe('team tasks', () => {
     expect((await tick('/tasks/2', 'review')).status, 'no proof required').toBe(422)
     expect((await tick('/tasks/12', 'done')).status, 'out of review').toBe(422)
     expect((await tick('/tasks/12', 'inProgress')).status, 'out of review').toBe(422)
-    expect((await tick('/tasks/2', 'inProgress')).status, 'the checkbox never sets in progress (0004)').toBe(422)
+    expect((await tick('/tasks/1', 'inProgress')).status, 'already in progress').toBe(422)
+    expect((await tick('/tasks/4', 'inProgress')).status, 'done').toBe(422)
     expect((await tick('/tasks/1', 'waiting')).status, 'in progress → waiting').toBe(422)
     expect((await tick('/tasks/2', 'todo')).status, 'personal-only status').toBe(422)
   })
