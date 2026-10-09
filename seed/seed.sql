@@ -1,6 +1,7 @@
 -- Dev and test data: the world of the app's FakeTasksApi. Dates are relative
 -- to today, so "today" and "overdue" always look right.
--- Passwords are a placeholder that never matches; A1 replaces them with PBKDF2 hashes.
+-- Every user's password is "password". Make a new hash with:
+--   bun -e "import {hashPassword} from './src/auth.ts'; console.log(await hashPassword('password'))"
 -- "Today" is the team's local day (UTC+7), stored as UTC.
 -- ponytail: fixed UTC+7, make it a parameter if the team spans time zones.
 -- Safe to run again: everything is cleared first, children before parents.
@@ -20,13 +21,13 @@ DELETE FROM users;
 DELETE FROM sqlite_sequence;
 
 INSERT INTO users (id, name, email, password, must_change_password, created_at, updated_at) VALUES
-  (1, 'Mira',  'mira@arcbyte.dev',  '!', 0, datetime('now'), datetime('now')),
-  (2, 'Ana',   'ana@arcbyte.dev',   '!', 0, datetime('now'), datetime('now')),
-  (3, 'Budi',  'budi@arcbyte.dev',  '!', 0, datetime('now'), datetime('now')),
-  (4, 'Citra', 'citra@arcbyte.dev', '!', 0, datetime('now'), datetime('now')),
-  (5, 'Dimas', 'dimas@arcbyte.dev', '!', 0, datetime('now'), datetime('now')),
-  (6, 'Eka',   'eka@arcbyte.dev',   '!', 0, datetime('now'), datetime('now')),
-  (7, 'Fajar', 'fajar@arcbyte.dev', '!', 0, datetime('now'), datetime('now'));
+  (1, 'Mira',  'mira@arcbyte.dev',  'pbkdf2_sha256$100000$aYcZ4HbhItQTTOEf14sASQ==$6YMHsCe+OdE3SEMDxafk9UPvpgBl6B4hkcKWIFgoEXA=', 0, datetime('now'), datetime('now')),
+  (2, 'Ana',   'ana@arcbyte.dev',   'pbkdf2_sha256$100000$KCQdhm0ZsSQoHqAG//uPUA==$hNKbBxQiBSRXKz77ctlX3qVShVgSE5Ca1E3Mm9exRtc=', 0, datetime('now'), datetime('now')),
+  (3, 'Budi',  'budi@arcbyte.dev',  'pbkdf2_sha256$100000$mhU6JxK2EjRDqETcY+kM9w==$mYBmxEEOrP1uZb5yVdBpBT4dzg4ZwPGDe9o9cC29gRQ=', 0, datetime('now'), datetime('now')),
+  (4, 'Citra', 'citra@arcbyte.dev', 'pbkdf2_sha256$100000$vIP4jqZB6GalnNe6BrFqbA==$kW1CXQOrHbBfyvOkSOgRL2YJl3J6OP3hnCZX8B2k0j8=', 0, datetime('now'), datetime('now')),
+  (5, 'Dimas', 'dimas@arcbyte.dev', 'pbkdf2_sha256$100000$EVr51+a6UNfN3SMGxCAoZA==$72hbj+t8R8PsCJFHgNDDPHWF7ceyWazcnflZ2SYOIFU=', 0, datetime('now'), datetime('now')),
+  (6, 'Eka',   'eka@arcbyte.dev',   'pbkdf2_sha256$100000$/9180t5I4TctKeEATMEYYA==$a27GGRPaVJl6JNU1nszZPtF5h5lSsc0FKLP1Vmr9nYk=', 0, datetime('now'), datetime('now')),
+  (7, 'Fajar', 'fajar@arcbyte.dev', 'pbkdf2_sha256$100000$gL4elREcV+XumVYoNy9fiA==$DmR8O9FOz0ZfOdLcIpRQvk4BShb7UxsybIdDg/gPvpg=', 0, datetime('now'), datetime('now'));
 
 INSERT INTO divisions (id, prefix, name, slug, created_at, updated_at) VALUES
   (1, 'TECH', 'tech', 'tech', datetime('now'), datetime('now'));
