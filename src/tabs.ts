@@ -4,7 +4,7 @@ import type { AppEnv } from './auth'
 
 export type Kind = 'private' | 'division' | 'project'
 
-const STATUS: Record<string, string> = { todo: 'todo', waiting: 'waiting', in_progress: 'inProgress', review: 'review', done: 'done' }
+export const STATUS: Record<string, string> = { todo: 'todo', waiting: 'waiting', in_progress: 'inProgress', review: 'review', done: 'done' }
 const PRIORITY = ['low', 'medium', 'high', 'urgent']
 
 /** D1 stores UTC as `YYYY-MM-DD HH:MM:SS`; the app wants ISO 8601. A bare date is midnight UTC. */

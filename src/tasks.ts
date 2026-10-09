@@ -1,10 +1,10 @@
 import { Hono, type Context } from 'hono'
 import { HTTPException } from 'hono/http-exception'
 import type { AppEnv } from './auth'
-import { assertMember, PERSONAL_TASK_COLUMNS, TEAM_TASK_COLUMNS, toTask, type TaskRow } from './tabs'
+import { assertMember, PERSONAL_TASK_COLUMNS, STATUS, TEAM_TASK_COLUMNS, toTask, type TaskRow } from './tabs'
 
 /** The app sends the Dart enum name; the database holds the snake_case value. */
-const DB_STATUS: Record<string, string> = { todo: 'todo', waiting: 'waiting', inProgress: 'in_progress', review: 'review', done: 'done' }
+const DB_STATUS: Record<string, string> = Object.fromEntries(Object.entries(STATUS).map(([db, app]) => [app, db]))
 
 /**
  * The checkbox rules (arcbyte decisions 0004 and 0005): what else to set for
@@ -35,6 +35,12 @@ async function newStatus(c: Context<AppEnv>) {
 const notAllowed = (from: string, to: string) => new HTTPException(422, { message: `Cannot move a task from ${from} to ${to}` })
 const changedMeanwhile = () => new HTTPException(409, { message: 'The task changed meanwhile; reload it' })
 
+/** A guarded update matched nothing: 404 if the task was deleted meanwhile, else 409. */
+async function goneOrChanged(db: D1Database, table: 'tasks' | 'personal_tasks', id: string) {
+  const gone = !(await db.prepare(`select 1 from ${table} where id = ?`).bind(id).first())
+  return gone ? new HTTPException(404, { message: 'No such task' }) : changedMeanwhile()
+}
+
 export const tasks = new Hono<AppEnv>()
 
 tasks.patch('/tasks/:id{[0-9]+}/status', async (c) => {
@@ -59,7 +65,7 @@ tasks.patch('/tasks/:id{[0-9]+}/status', async (c) => {
   )
     .bind(to, c.req.param('id'), task.status)
     .first<TaskRow>()
-  if (!row) throw changedMeanwhile()
+  if (!row) throw await goneOrChanged(c.env.DB, 'tasks', c.req.param('id'))
   return c.json(toTask(row))
 })
 
@@ -79,6 +85,6 @@ tasks.patch('/personal-tasks/:id{[0-9]+}/status', async (c) => {
   )
     .bind(to, c.req.param('id'), task.status)
     .first<TaskRow>()
-  if (!row) throw changedMeanwhile()
+  if (!row) throw await goneOrChanged(c.env.DB, 'personal_tasks', c.req.param('id'))
   return c.json(toTask(row))
 })
