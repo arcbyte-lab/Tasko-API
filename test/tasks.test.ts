@@ -113,6 +113,12 @@ describe('sub-tasks', () => {
     expect(await json(send('POST', '/tasks/7/subtasks', { name: 'Check CI' }))).toMatchObject({ parentId: 7, assigneeId: null })
   })
 
+  it('is one level deep: a sub-task can’t have its own', async () => {
+    const sub = (await json(send('POST', '/tasks/7/subtasks', { name: 'Check CI' }))) as any
+    expect((await send('POST', `/tasks/${sub.id}/subtasks`, { name: 'x' })).status).toBe(422)
+    expect((await send('POST', '/personal-tasks/7/subtasks', { name: 'x' })).status, 'personal 7 is a sub-task').toBe(422)
+  })
+
   it('a personal sub-task belongs to the owner', async () => {
     expect(await json(send('POST', '/personal-tasks/1/subtasks', { name: 'Pick a TLD' }))).toMatchObject({ parentId: 1, personal: true, status: 'todo' })
     expect((await send('POST', '/personal-tasks/1/subtasks', { name: 'x' }, await login('ana@arcbyte.dev'))).status).toBe(404)

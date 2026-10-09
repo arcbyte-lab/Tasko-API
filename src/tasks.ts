@@ -216,8 +216,16 @@ tasks.patch('/personal-tasks/:id{[0-9]+}', async (c) => {
 })
 
 /** A sub-task stays in its parent's tab and starts with the parent's assignee, if they can still be assigned there. */
+/** Sub-tasks are one level deep: a sub-task can't have its own. */
+async function assertTopLevel(db: D1Database, table: 'tasks' | 'personal_tasks', id: string) {
+  if ((await db.prepare(`select parent_id from ${table} where id = ?`).bind(id).first('parent_id')) !== null) {
+    throw new HTTPException(422, { message: 'A sub-task cannot have sub-tasks' })
+  }
+}
+
 tasks.post('/tasks/:id{[0-9]+}/subtasks', async (c) => {
   const parent = await teamTask(c)
+  await assertTopLevel(c.env.DB, 'tasks', c.req.param('id'))
   const { name } = await readFields(c, ['name'])
   const tab = tabOf(parent)
   const keep = parent.assignee_id !== null && (await isAssignable(c.env.DB, tab.kind, tab.id, parent.assignee_id))
@@ -237,6 +245,7 @@ tasks.post('/tasks/:id{[0-9]+}/subtasks', async (c) => {
 
 tasks.post('/personal-tasks/:id{[0-9]+}/subtasks', async (c) => {
   await ownPersonalTask(c)
+  await assertTopLevel(c.env.DB, 'personal_tasks', c.req.param('id'))
   const { name } = await readFields(c, ['name'])
   return c.json(toTask((await insertPersonalTask(c.env.DB, c.get('user').id, Number(c.req.param('id')), { name }))!), 201)
 })
