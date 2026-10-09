@@ -91,12 +91,12 @@ tabs.get('/:kind{private|division|project}/:id{[0-9]+}/tasks', async (c) => {
   const id = Number(c.req.param('id'))
   const me = c.get('user').id
   await assertMember(c.env.DB, kind, id, me)
-  const query = {
-    private: [`select ${PERSONAL_TASK_COLUMNS} from personal_tasks where user_id = ? and parent_id is null order by position, id`, me],
-    division: [`select ${TEAM_TASK_COLUMNS} from tasks where division_id = ? and project_id is null and parent_id is null order by id`, id],
-    project: [`select ${TEAM_TASK_COLUMNS} from tasks where project_id = ? and parent_id is null order by id`, id],
+  const sql = {
+    private: `select ${PERSONAL_TASK_COLUMNS} from personal_tasks where user_id = ? and parent_id is null order by position, id`,
+    division: `select ${TEAM_TASK_COLUMNS} from tasks where division_id = ? and project_id is null and parent_id is null order by id`,
+    project: `select ${TEAM_TASK_COLUMNS} from tasks where project_id = ? and parent_id is null order by id`,
   }[kind]
-  const { results } = await c.env.DB.prepare(query[0] as string).bind(query[1]).all<TaskRow>()
+  const { results } = await c.env.DB.prepare(sql).bind(kind === 'private' ? me : id).all<TaskRow>()
   return c.json(results.map(toTask))
 })
 
