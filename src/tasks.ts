@@ -1,7 +1,7 @@
 import { Hono, type Context } from 'hono'
 import { HTTPException } from 'hono/http-exception'
 import type { AppEnv } from './auth'
-import { assertMember, membersOf, PERSONAL_TASK_COLUMNS, STATUS, TEAM_TASK_COLUMNS, toTask, type TaskRow } from './tabs'
+import { assertMember, PERSONAL_TASK_COLUMNS, STATUS, TEAM_TASK_COLUMNS, toTask, type TaskRow } from './tabs'
 
 /** The app sends the Dart enum name; the database holds the snake_case value. */
 const DB_STATUS: Record<string, string> = Object.fromEntries(Object.entries(STATUS).map(([db, app]) => [app, db]))
@@ -24,9 +24,17 @@ function personalMove(from: string, to: string): string | null {
   return null
 }
 
+const bad = (message: string) => new HTTPException(400, { message })
+
+/** The JSON body as an object; null, an array, a bare value or bad JSON is a 400. */
+async function readBody(c: Context<AppEnv>): Promise<Record<string, unknown>> {
+  const body: unknown = await c.req.json().catch(() => undefined)
+  if (typeof body !== 'object' || body === null || Array.isArray(body)) throw bad('The body must be a JSON object')
+  return body as Record<string, unknown>
+}
+
 async function newStatus(c: Context<AppEnv>) {
-  const body = await c.req.json<{ status?: unknown } | null>().catch(() => null)
-  const { status } = body ?? {}
+  const { status } = await readBody(c)
   const to = typeof status === 'string' && Object.hasOwn(DB_STATUS, status) ? DB_STATUS[status] : undefined
   if (!to) throw new HTTPException(400, { message: 'status must be one of ' + Object.keys(DB_STATUS).join(', ') })
   return to
@@ -34,14 +42,23 @@ async function newStatus(c: Context<AppEnv>) {
 
 const notAllowed = (from: string, to: string) => new HTTPException(422, { message: `Cannot move a task from ${from} to ${to}` })
 const changedMeanwhile = () => new HTTPException(409, { message: 'The task changed meanwhile; reload it' })
-const bad = (message: string) => new HTTPException(400, { message })
 const noAssignee = () => new HTTPException(422, { message: 'A personal task has no assignee' })
 
 type Fields = { name?: string; description?: string | null; priority?: number; dueDate?: string | null; assigneeId?: number | null }
 
+/** A strict ISO 8601 date or date-time, or null; `new Date` alone takes 'March 5' and rolls Feb 30 into March. */
+function parseDue(s: unknown) {
+  const m = typeof s === 'string' && /^(\d{4})-(\d\d)-(\d\d)(T\d\d:\d\d(:\d\d(\.\d+)?)?(Z|[+-]\d\d:\d\d)?)?$/.exec(s)
+  if (!m) return null
+  const day = new Date(Date.UTC(+m[1], +m[2] - 1, +m[3]))
+  if (day.getUTCMonth() !== +m[2] - 1 || day.getUTCDate() !== +m[3]) return null
+  const due = new Date(s as string)
+  return isNaN(due.getTime()) ? null : due
+}
+
 /** The editable fields present in the body; [required] ones must be there. */
 async function readFields(c: Context<AppEnv>, required: (keyof Fields)[]): Promise<Fields> {
-  const body = await c.req.json<Record<string, unknown>>().catch(() => ({}) as Record<string, unknown>)
+  const body = await readBody(c)
   for (const key of required) if (!(key in body)) throw bad(`${key} is required`)
   const f: Fields = {}
   if ('name' in body) {
@@ -58,8 +75,8 @@ async function readFields(c: Context<AppEnv>, required: (keyof Fields)[]): Promi
     f.priority = p
   }
   if ('dueDate' in body) {
-    const due = typeof body.dueDate === 'string' ? new Date(body.dueDate) : null
-    if (body.dueDate !== null && (!due || isNaN(due.getTime()))) throw bad('dueDate must be an ISO 8601 date or null')
+    const due = parseDue(body.dueDate)
+    if (body.dueDate !== null && !due) throw bad('dueDate must be an ISO 8601 date or null')
     f.dueDate = due && due.toISOString().slice(0, 19).replace('T', ' ') // D1's UTC datetime format
   }
   if ('assigneeId' in body) {
@@ -69,10 +86,16 @@ async function readFields(c: Context<AppEnv>, required: (keyof Fields)[]): Promi
   return f
 }
 
-/** 422 unless [assigneeId] is in the tab's members list (A2). */
+/** Whether [userId] is an active member of the tab, as its members list (A2) counts them. */
+async function isAssignable(db: D1Database, kind: 'division' | 'project', tabId: number, userId: number) {
+  const members = kind === 'division' ? 'division_members m where m.division_id' : 'project_members m where m.project_id'
+  const sql = `select 1 from ${members} = ?1 and m.user_id = ?2 and exists (select 1 from users u where u.id = m.user_id and u.is_active = 1)`
+  return !!(await db.prepare(sql).bind(tabId, userId).first())
+}
+
+/** 422 unless [assigneeId] is null or assignable in the tab. */
 async function assertAssignable(db: D1Database, kind: 'division' | 'project', tabId: number, assigneeId: number | null | undefined) {
-  if (assigneeId == null) return
-  if (!(await membersOf(db, kind, tabId, 0)).some((m) => m.user.id === assigneeId)) {
+  if (assigneeId != null && !(await isAssignable(db, kind, tabId, assigneeId))) {
     throw new HTTPException(422, { message: 'The assignee is not a member of this tab' })
   }
 }
@@ -83,9 +106,9 @@ const tabOf = (t: TeamTask) =>
 
 /** A team task in one of the viewer's tabs: 404 if missing, 403 if outside them. */
 async function teamTask(c: Context<AppEnv>) {
-  const task = await c.env.DB.prepare('select division_id, project_id, assignee_id from tasks where id = ?')
+  const task = await c.env.DB.prepare('select division_id, project_id, assignee_id, status, required_proof_type from tasks where id = ?')
     .bind(c.req.param('id'))
-    .first<TeamTask>()
+    .first<TeamTask & { status: string; required_proof_type: string | null }>()
   if (!task) throw new HTTPException(404, { message: 'No such task' })
   const tab = tabOf(task)
   await assertMember(c.env.DB, tab.kind, tab.id, c.get('user').id)
@@ -93,9 +116,12 @@ async function teamTask(c: Context<AppEnv>) {
 }
 
 /** Someone else's personal task does not exist, as far as the viewer can tell. */
-async function assertOwnPersonalTask(c: Context<AppEnv>) {
-  const task = await c.env.DB.prepare('select 1 from personal_tasks where id = ? and user_id = ?').bind(c.req.param('id'), c.get('user').id).first()
+async function ownPersonalTask(c: Context<AppEnv>) {
+  const task = await c.env.DB.prepare('select status from personal_tasks where id = ? and user_id = ?')
+    .bind(c.req.param('id'), c.get('user').id)
+    .first<{ status: string }>()
   if (!task) throw new HTTPException(404, { message: 'No such task' })
+  return task
 }
 
 /**
@@ -107,7 +133,7 @@ function insertTeamTask(db: D1Database, t: TeamTask & { parent_id: number | null
     .prepare(
       `insert into tasks (code, division_id, project_id, parent_id, creator_id, assignee_id, name, description, priority_level, due_date, created_at, updated_at)
        select d.prefix || '-' || printf('%04d', 1 + coalesce(
-           (select max(cast(substr(x.code, length(d.prefix) + 2) as integer)) from tasks x where x.code like d.prefix || '-%'), 0)),
+           (select max(cast(substr(x.code, length(d.prefix) + 2) as integer)) from tasks x where substr(x.code, 1, length(d.prefix) + 1) = d.prefix || '-'), 0)),
          d.id, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, datetime('now'), datetime('now')
        from divisions d where d.id = ?1
        returning ${TEAM_TASK_COLUMNS}`,
@@ -151,12 +177,12 @@ tasks.post('/tabs/:kind{private|division|project}/:id{[0-9]+}/tasks', async (c) 
   const kind = c.req.param('kind') as 'private' | 'division' | 'project'
   const id = Number(c.req.param('id'))
   const me = c.get('user').id
+  await assertMember(c.env.DB, kind, id, me)
   const f = await readFields(c, ['name', 'priority'])
   if (kind === 'private') {
     if (f.assigneeId != null) throw noAssignee()
     return c.json(toTask((await insertPersonalTask(c.env.DB, me, null, f))!), 201)
   }
-  await assertMember(c.env.DB, kind, id, me)
   await assertAssignable(c.env.DB, kind, id, f.assigneeId)
   const division_id =
     kind === 'division' ? id : (await c.env.DB.prepare('select division_id from projects where id = ?').bind(id).first<number>('division_id'))!
@@ -178,7 +204,7 @@ tasks.patch('/tasks/:id{[0-9]+}', async (c) => {
 })
 
 tasks.patch('/personal-tasks/:id{[0-9]+}', async (c) => {
-  await assertOwnPersonalTask(c)
+  await ownPersonalTask(c)
   const f = await readFields(c, [])
   if (f.assigneeId != null) throw noAssignee()
   delete f.assigneeId
@@ -189,16 +215,28 @@ tasks.patch('/personal-tasks/:id{[0-9]+}', async (c) => {
   return c.json(toTask(row!))
 })
 
-/** A sub-task stays in its parent's tab and starts with the parent's assignee. */
+/** A sub-task stays in its parent's tab and starts with the parent's assignee, if they can still be assigned there. */
 tasks.post('/tasks/:id{[0-9]+}/subtasks', async (c) => {
   const parent = await teamTask(c)
   const { name } = await readFields(c, ['name'])
-  const row = await insertTeamTask(c.env.DB, { ...parent, parent_id: Number(c.req.param('id')), creator_id: c.get('user').id }, { name })
+  const tab = tabOf(parent)
+  const keep = parent.assignee_id !== null && (await isAssignable(c.env.DB, tab.kind, tab.id, parent.assignee_id))
+  const row = await insertTeamTask(
+    c.env.DB,
+    {
+      division_id: parent.division_id,
+      project_id: parent.project_id,
+      assignee_id: keep ? parent.assignee_id : null,
+      parent_id: Number(c.req.param('id')),
+      creator_id: c.get('user').id,
+    },
+    { name },
+  )
   return c.json(toTask(row!), 201)
 })
 
 tasks.post('/personal-tasks/:id{[0-9]+}/subtasks', async (c) => {
-  await assertOwnPersonalTask(c)
+  await ownPersonalTask(c)
   const { name } = await readFields(c, ['name'])
   return c.json(toTask((await insertPersonalTask(c.env.DB, c.get('user').id, Number(c.req.param('id')), { name }))!), 201)
 })
@@ -206,14 +244,8 @@ tasks.post('/personal-tasks/:id{[0-9]+}/subtasks', async (c) => {
 tasks.patch('/tasks/:id{[0-9]+}/status', async (c) => {
   const me = c.get('user').id
   const to = await newStatus(c)
-  const task = await c.env.DB.prepare('select status, division_id, project_id, assignee_id, required_proof_type from tasks where id = ?')
-    .bind(c.req.param('id'))
-    .first<TeamTask & { status: string; required_proof_type: string | null }>()
-  if (!task) throw new HTTPException(404, { message: 'No such task' })
-
   // Only in a tab the viewer can see; then the assignee ticks it, or anyone if it's unassigned.
-  const tab = tabOf(task)
-  await assertMember(c.env.DB, tab.kind, tab.id, me)
+  const task = await teamTask(c)
   if (task.assignee_id !== null && task.assignee_id !== me) {
     throw new HTTPException(403, { message: 'Only the assignee can change this task' })
   }
@@ -232,10 +264,7 @@ tasks.patch('/tasks/:id{[0-9]+}/status', async (c) => {
 
 tasks.patch('/personal-tasks/:id{[0-9]+}/status', async (c) => {
   const to = await newStatus(c)
-  const task = await c.env.DB.prepare('select status from personal_tasks where id = ? and user_id = ?')
-    .bind(c.req.param('id'), c.get('user').id)
-    .first<{ status: string }>()
-  if (!task) throw new HTTPException(404, { message: 'No such task' })
+  const task = await ownPersonalTask(c)
 
   const also = personalMove(task.status, to)
   if (also === null) throw notAllowed(task.status, to)

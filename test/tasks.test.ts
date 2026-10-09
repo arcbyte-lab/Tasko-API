@@ -44,6 +44,17 @@ describe('create', () => {
     expect((await json(send('POST', '/tabs/division/2/tasks', { name: 'x', priority: 2 }))).code).toBe('OPS-0001')
   })
 
+  it('reads a prefix literally: `_` is not a wildcard and case counts', async () => {
+    await env.DB.batch([
+      env.DB.prepare("insert into divisions (id, prefix, name, slug) values (2, 'T_', 't', 't')"),
+      env.DB.prepare("insert into division_members (user_id, division_id, role_type) values (1, 2, 'member')"),
+      env.DB.prepare("insert into divisions (id, prefix, name, slug) values (3, 'tech', 'lower', 'lower')"),
+      env.DB.prepare("insert into division_members (user_id, division_id, role_type) values (1, 3, 'member')"),
+    ])
+    expect((await json(send('POST', '/tabs/division/2/tasks', { name: 'x', priority: 2 }))).code).toBe('T_-0001')
+    expect((await json(send('POST', '/tabs/division/3/tasks', { name: 'x', priority: 2 }))).code).toBe('tech-0001')
+  })
+
   it('rejects an assignee from outside the tab', async () => {
     await env.DB.prepare("insert into users (id, name, email, password) values (8, 'Gita', 'gita@arcbyte.dev', '!')").run()
     expect((await send('POST', '/tabs/project/1/tasks', { name: 'x', priority: 2, assigneeId: 8 })).status).toBe(422)
@@ -54,6 +65,15 @@ describe('create', () => {
     expect((await send('POST', '/tabs/project/1/tasks', { priority: 2 })).status).toBe(400)
     expect((await send('POST', '/tabs/project/1/tasks', { name: 'x', priority: 5 })).status).toBe(400)
     expect((await send('POST', '/tabs/project/1/tasks', { name: 'x', priority: 2, dueDate: 'soon' })).status).toBe(400)
+    for (const dueDate of ['March 5', '2026-02-30', '2026-13-01', '1']) {
+      expect((await send('POST', '/tabs/project/1/tasks', { name: 'x', priority: 2, dueDate })).status, dueDate).toBe(400)
+    }
+    expect((await send('POST', '/tabs/project/1/tasks', { name: 'x', priority: 2, dueDate: '2026-02-28' })).status).toBe(201)
+    for (const body of [null, 'x', 5, []]) {
+      expect((await send('POST', '/tabs/project/1/tasks', body)).status, JSON.stringify(body)).toBe(400)
+      expect((await send('PATCH', '/tasks/2', body)).status, JSON.stringify(body)).toBe(400)
+    }
+    expect((await send('POST', '/tabs/private/5/tasks', { name: 'x', priority: 2 })).status, 'private is only 0').toBe(404)
     await env.DB.prepare('delete from project_members where project_id = 1 and user_id = 1').run()
     expect((await send('POST', '/tabs/project/1/tasks', { name: 'x', priority: 2 })).status).toBe(403)
   })
@@ -86,6 +106,11 @@ describe('sub-tasks', () => {
     const sub = (await res.json()) as any
     expect(sub).toMatchObject({ parentId: 7, assigneeId: 3, status: 'waiting', code: 'TECH-0002' })
     expect(await env.DB.prepare('select division_id, project_id from tasks where id = ?').bind(sub.id).first()).toEqual({ division_id: 1, project_id: 2 })
+  })
+
+  it('a team sub-task starts unassigned if the parent’s assignee has left the tab', async () => {
+    await env.DB.prepare('delete from project_members where project_id = 2 and user_id = 3').run()
+    expect(await json(send('POST', '/tasks/7/subtasks', { name: 'Check CI' }))).toMatchObject({ parentId: 7, assigneeId: null })
   })
 
   it('a personal sub-task belongs to the owner', async () => {
