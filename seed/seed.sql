@@ -8,6 +8,7 @@
 
 DELETE FROM notifications;
 DELETE FROM task_deadline_requests;
+DELETE FROM proofs;
 DELETE FROM comments;
 DELETE FROM task_reviews;
 DELETE FROM tasks;
@@ -107,3 +108,8 @@ INSERT INTO tasks (id, code, division_id, project_id, creator_id, assignee_id, p
 INSERT INTO comments (task_id, user_id, comment, created_at, updated_at) VALUES
   (5, 2, 'Only happens on Safari for me. Chrome is fine.', datetime('now', '-2 hours'),    datetime('now', '-2 hours')),
   (5, 3, 'Can this ship before Friday''s release?',        datetime('now', '-45 minutes'), datetime('now', '-45 minutes'));
+
+-- The two tasks in review were sent with their proof link (decision 0004).
+INSERT INTO proofs (task_id, user_id, file, created_at, updated_at) VALUES
+  (7,  3, 'https://github.com/arcbyte-lab/tasko-api/pull/42',           datetime('now', '-1 hours'), datetime('now', '-1 hours')),
+  (12, 1, 'https://drive.google.com/file/d/qa-checkout-flow-report/view', datetime('now', '-3 hours'), datetime('now', '-3 hours'));

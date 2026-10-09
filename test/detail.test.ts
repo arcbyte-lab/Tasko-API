@@ -26,6 +26,13 @@ describe('team task detail', () => {
     ])
     expect(d.comments[0].createdAt).toMatch(/Z$/)
     expect(d.assignee).toEqual({ id: 1, name: 'Mira' })
+    expect(d.proof).toBeNull()
+  })
+
+  it('shows the latest proof link to the reviewer', async () => {
+    const d = await detail('/tasks/12')
+    expect(d.proof).toMatchObject({ url: 'https://drive.google.com/file/d/qa-checkout-flow-report/view', author: { id: 1, name: 'Mira' } })
+    expect(d.proof.createdAt).toMatch(/Z$/)
   })
 
   it('on tasko-web, where Mira is the author, she reviews and never asks for an extension', async () => {
@@ -62,7 +69,7 @@ it('personal task detail: private tab, sub-tasks, no comments, all flags false',
   const d = await detail('/personal-tasks/1')
   expect(d).toMatchObject({
     tab: { kind: 'private', id: 0, name: 'private' }, comments: [], assignee: null,
-    canReview: false, canArchive: false, canRequestExtension: false,
+    canReview: false, canArchive: false, canRequestExtension: false, proof: null,
   })
   expect(d.subtasks.map((t: any) => t.name)).toEqual(['Compare registrars', 'Set up DNS'])
   expect((await api(await login('ana@arcbyte.dev'), '/personal-tasks/1/detail')).status).toBe(404)
