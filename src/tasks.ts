@@ -35,10 +35,26 @@ async function readBody(c: Context<AppEnv>): Promise<Record<string, unknown>> {
 }
 
 async function newStatus(c: Context<AppEnv>) {
-  const { status } = await readBody(c)
-  const to = typeof status === 'string' && Object.hasOwn(DB_STATUS, status) ? DB_STATUS[status] : undefined
+  const body = await readBody(c)
+  const to = typeof body.status === 'string' && Object.hasOwn(DB_STATUS, body.status) ? DB_STATUS[body.status] : undefined
   if (!to) throw new HTTPException(400, { message: 'status must be one of ' + Object.keys(DB_STATUS).join(', ') })
-  return to
+  return { to, body }
+}
+
+/**
+ * A proof is a link for now (owner's call, 2026-10-09): an http(s) URL. Sending a
+ * task to review needs one (decision 0004: the user is asked for it first).
+ */
+function proofLink(value: unknown) {
+  const s = typeof value === 'string' ? value.trim() : ''
+  let url: URL | null = null
+  try {
+    url = new URL(s)
+  } catch {}
+  if (!url || (url.protocol !== 'https:' && url.protocol !== 'http:') || s.length > 2048) {
+    throw bad('proofUrl must be an http or https link; a task needs one to go to review')
+  }
+  return s
 }
 
 const notAllowed = (from: string, to: string) => new HTTPException(422, { message: `Cannot move a task from ${from} to ${to}` })
@@ -276,7 +292,7 @@ tasks.post('/personal-tasks/:id{[0-9]+}/subtasks', async (c) => {
 
 tasks.patch('/tasks/:id{[0-9]+}/status', async (c) => {
   const me = c.get('user').id
-  const to = await newStatus(c)
+  const { to, body } = await newStatus(c)
   // Only in a tab the viewer can see; then the assignee ticks it, or anyone if it's unassigned.
   const task = await teamTask(c)
   if (task.assignee_id !== null && task.assignee_id !== me) {
@@ -285,12 +301,24 @@ tasks.patch('/tasks/:id{[0-9]+}/status', async (c) => {
 
   const also = teamMove(task.status, to, task.required_proof_type !== null)
   if (also === null) throw notAllowed(task.status, to)
-  const row = await c.env.DB.prepare(
+  const proof = to === 'review' ? proofLink(body.proofUrl) : null
+  const update = c.env.DB.prepare(
     `update tasks set status = ?1, ${also ? also + ', ' : ''}updated_at = datetime('now')
      where id = ?2 and status = ?3 returning ${TEAM_TASK_COLUMNS}`,
+  ).bind(to, c.req.param('id'), task.status)
+  // With a proof, one transaction: the proof row is written only if the status moved.
+  const [updated] = await c.env.DB.batch<TaskRow>(
+    proof === null
+      ? [update]
+      : [
+          update,
+          c.env.DB.prepare(
+            `insert into proofs (task_id, user_id, file, created_at, updated_at)
+             select ?, ?, ?, datetime('now'), datetime('now') where changes() = 1`,
+          ).bind(c.req.param('id'), me, proof),
+        ],
   )
-    .bind(to, c.req.param('id'), task.status)
-    .first<TaskRow>()
+  const row = updated.results[0]
   if (!row) throw await goneOrChanged(c.env.DB, 'tasks', c.req.param('id'))
   if (to === 'review') {
     await notify(c.env.DB, await reviewersOf(c.env.DB, task), 'task_review_requested', { taskId: row.id, taskName: row.name, actorId: me })
@@ -299,7 +327,7 @@ tasks.patch('/tasks/:id{[0-9]+}/status', async (c) => {
 })
 
 tasks.patch('/personal-tasks/:id{[0-9]+}/status', async (c) => {
-  const to = await newStatus(c)
+  const { to } = await newStatus(c)
   const task = await ownPersonalTask(c)
 
   const also = personalMove(task.status, to)
@@ -338,7 +366,7 @@ tasks.get('/tasks/:id{[0-9]+}/detail', async (c) => {
   const me = c.get('user').id
   const task = await teamTask(c)
   const tab = tabOf(task)
-  const [tabRow, subtasks, comments, assignee, reviewer] = await Promise.all([
+  const [tabRow, subtasks, comments, assignee, reviewer, proof] = await Promise.all([
     c.env.DB.prepare(`select name from ${tab.kind === 'project' ? 'projects' : 'divisions'} where id = ?`).bind(tab.id).first<string>('name'),
     c.env.DB.prepare(`select ${TEAM_TASK_COLUMNS} from tasks where parent_id = ? order by created_at, id`).bind(c.req.param('id')).all<TaskRow>(),
     c.env.DB.prepare(
@@ -350,12 +378,20 @@ tasks.get('/tasks/:id{[0-9]+}/detail', async (c) => {
     task.assignee_id === null ? null : c.env.DB.prepare('select id, name from users where id = ?').bind(task.assignee_id).first(),
     // Only the review and extension flags read it, so skip the query when neither can be true.
     task.status === 'review' || task.assignee_id === me ? isReviewer(c.env.DB, task, me) : false,
+    c.env.DB.prepare(
+      `select p.file url, u.id, u.name, p.created_at from proofs p join users u on u.id = p.user_id
+       where p.task_id = ? order by p.created_at desc, p.id desc limit 1`,
+    )
+      .bind(c.req.param('id'))
+      .first<{ url: string; id: number; name: string; created_at: string }>(),
   ])
   return c.json({
     tab: { kind: tab.kind, id: tab.id, name: tabRow },
     subtasks: subtasks.results.map(toTask),
     comments: comments.results.map((r) => ({ author: { id: r.id, name: r.name }, body: r.body, createdAt: iso(r.created_at) })),
     assignee,
+    // The latest proof; an earlier one stays in the table after a rejection.
+    proof: proof && { url: proof.url, author: { id: proof.id, name: proof.name }, createdAt: iso(proof.created_at) },
     canReview: task.status === 'review' && reviewer,
     canArchive: task.creator_id === me,
     // Only open tasks can be overdue (decision 0004).
@@ -373,6 +409,7 @@ tasks.get('/personal-tasks/:id{[0-9]+}/detail', async (c) => {
     subtasks: results.map(toTask),
     comments: [],
     assignee: null,
+    proof: null,
     canReview: false,
     canArchive: false,
     canRequestExtension: false,

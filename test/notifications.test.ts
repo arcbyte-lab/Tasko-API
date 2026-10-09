@@ -35,13 +35,13 @@ describe('producers', () => {
   })
 
   it('sending a task to review notifies every reviewer but the actor', async () => {
-    await send('PATCH', '/tasks/5/status', { status: 'review' }) // tasko-web: reviewers are Mira (author) and Ana (person-in-charge)
+    await send('PATCH', '/tasks/5/status', { status: 'review', proofUrl: 'https://example.com/p' }) // tasko-web: reviewers are Mira (author) and Ana (person-in-charge)
     expect((await rows()).map((r) => [r.type, r.notifiable_id, r.data.taskId])).toEqual([['task_review_requested', 2, 5]])
     expect((await bell(await login('ana@arcbyte.dev')))[0].text).toBe('Mira sent Fix login redirect for review')
 
     await env.DB.prepare("update tasks set required_proof_type = 'file' where id = 23").run() // division-only: Ana is admin
     await env.DB.prepare("update division_members set role_type = 'supervisor' where user_id = 4").run()
-    await send('PATCH', '/tasks/23/status', { status: 'review' })
+    await send('PATCH', '/tasks/23/status', { status: 'review', proofUrl: 'https://example.com/p' })
     expect((await rows()).slice(1).map((r) => r.notifiable_id).sort()).toEqual([2, 4])
   })
 
@@ -50,7 +50,7 @@ describe('producers', () => {
       env.DB.prepare('update tasks set assignee_id = 3 where id = 5'), // Budi's now
       env.DB.prepare('delete from project_members where project_id = 2 and user_id = 1'), // Mira, tasko-web's author, leaves
     ])
-    expect((await send('PATCH', '/tasks/5/status', { status: 'review' }, await login('budi@arcbyte.dev'))).status).toBe(200)
+    expect((await send('PATCH', '/tasks/5/status', { status: 'review', proofUrl: 'https://example.com/p' }, await login('budi@arcbyte.dev'))).status).toBe(200)
     expect((await rows()).map((r) => r.notifiable_id)).toEqual([2])
   })
 

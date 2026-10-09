@@ -7,8 +7,9 @@ beforeEach(async () => {
   mira = await login()
 })
 
-const tick = (path: string, status: string, token = mira) =>
-  api(token, `${path}/status`, { method: 'PATCH', body: JSON.stringify({ status }) })
+const tick = (path: string, status: string, token = mira, extra = {}) =>
+  api(token, `${path}/status`, { method: 'PATCH', body: JSON.stringify({ status, ...extra }) })
+const LINK = { proofUrl: 'https://drive.google.com/file/d/abc/view' }
 const row = (sql: string) => env.DB.prepare(sql).first<any>()
 
 describe('personal tasks', () => {
@@ -43,11 +44,27 @@ describe('team tasks', () => {
     expect(task.completedAt).toMatch(/Z$/)
   })
 
-  it('open → review when a proof is required, setting review_date', async () => {
-    const res = await tick('/tasks/5', 'review')
+  it('open → review when a proof is required, with its link: review_date set, proof stored', async () => {
+    const res = await tick('/tasks/5', 'review', mira, { proofUrl: ' https://drive.google.com/file/d/abc/view ' })
     expect(res.status).toBe(200)
     expect(((await res.json()) as any).status).toBe('review')
     expect((await row('select review_date from tasks where id = 5')).review_date).not.toBeNull()
+    expect(await row('select task_id, user_id, file from proofs where task_id = 5')).toEqual({
+      task_id: 5, user_id: 1, file: 'https://drive.google.com/file/d/abc/view',
+    })
+  })
+
+  it('review without an http(s) proof link is a 400 and changes nothing', async () => {
+    for (const extra of [{}, { proofUrl: '' }, { proofUrl: 'not a link' }, { proofUrl: 'javascript:alert(1)' }, { proofUrl: 5 }]) {
+      expect((await tick('/tasks/5', 'review', mira, extra)).status, JSON.stringify(extra)).toBe(400)
+    }
+    expect((await row('select status from tasks where id = 5')).status).toBe('in_progress')
+    expect(await row('select count(*) n from proofs where task_id = 5')).toEqual({ n: 0 })
+  })
+
+  it('a refused move stores no proof', async () => {
+    expect((await tick('/tasks/2', 'review', mira, LINK)).status, 'no proof required').toBe(422)
+    expect(await row('select count(*) n from proofs where task_id = 2')).toEqual({ n: 0 })
   })
 
   it('done → waiting clears completed_date and review_date', async () => {
@@ -83,7 +100,7 @@ describe('team tasks', () => {
     await env.DB.prepare('delete from project_members where project_id = 1 and user_id = 1').run()
     expect((await tick('/tasks/2', 'done')).status, 'removed').toBe(403)
     await env.DB.prepare("update projects set status = 'archived' where id = 2").run()
-    expect((await tick('/tasks/5', 'review')).status, 'archived').toBe(403)
+    expect((await tick('/tasks/5', 'review', mira, LINK)).status, 'archived').toBe(403)
   })
 })
 
