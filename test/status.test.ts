@@ -50,9 +50,11 @@ describe('team tasks', () => {
     expect((await row('select review_date from tasks where id = 5')).review_date).not.toBeNull()
   })
 
-  it('done → waiting clears completed_date', async () => {
+  it('done → waiting clears completed_date and review_date', async () => {
+    await env.DB.prepare("update tasks set review_date = datetime('now') where id = 4").run()
     const task = (await (await tick('/tasks/4', 'waiting')).json()) as any
     expect(task).toMatchObject({ status: 'waiting', completedAt: null })
+    expect((await row('select review_date from tasks where id = 4')).review_date).toBeNull()
   })
 
   it('waiting → in progress', async () => {
@@ -79,9 +81,19 @@ describe('team tasks', () => {
     await env.DB.prepare('delete from project_members where project_id = 1 and user_id = 1').run()
     expect((await tick('/tasks/3', 'inProgress')).status).toBe(403)
   })
+
+  it('not even the assignee, once removed from the tab or once it is archived', async () => {
+    await env.DB.prepare('delete from project_members where project_id = 1 and user_id = 1').run()
+    expect((await tick('/tasks/2', 'inProgress')).status, 'removed').toBe(403)
+    await env.DB.prepare("update projects set status = 'archived' where id = 2").run()
+    expect((await tick('/tasks/5', 'review')).status, 'archived').toBe(403)
+  })
 })
 
 it('rejects an unknown status and an unknown task', async () => {
   expect((await tick('/tasks/1', 'in_progress')).status).toBe(400)
   expect((await tick('/tasks/999', 'done')).status).toBe(404)
+  expect((await tick('/tasks/1', 'constructor')).status, 'inherited key').toBe(400)
+  const nullBody = await api(mira, '/tasks/1/status', { method: 'PATCH', body: 'null' })
+  expect(nullBody.status, 'null body').toBe(400)
 })

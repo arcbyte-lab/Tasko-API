@@ -14,7 +14,7 @@ function teamMove(from: string, to: string, needsReview: boolean): string | null
   const open = from === 'waiting' || from === 'in_progress'
   if (open && to === 'done' && !needsReview) return "completed_date = datetime('now')"
   if (open && to === 'review' && needsReview) return "review_date = datetime('now')"
-  if (from === 'done' && to === 'waiting') return 'completed_date = null'
+  if (from === 'done' && to === 'waiting') return 'completed_date = null, review_date = null'
   if (from === 'waiting' && to === 'in_progress') return ''
   return null
 }
@@ -26,8 +26,9 @@ function personalMove(from: string, to: string): string | null {
 }
 
 async function newStatus(c: Context<AppEnv>) {
-  const { status } = await c.req.json<{ status?: unknown }>().catch(() => ({}) as never)
-  const to = typeof status === 'string' ? DB_STATUS[status] : undefined
+  const body = await c.req.json<{ status?: unknown } | null>().catch(() => null)
+  const { status } = body ?? {}
+  const to = typeof status === 'string' && Object.hasOwn(DB_STATUS, status) ? DB_STATUS[status] : undefined
   if (!to) throw new HTTPException(400, { message: 'status must be one of ' + Object.keys(DB_STATUS).join(', ') })
   return to
 }
@@ -45,10 +46,9 @@ tasks.patch('/tasks/:id{[0-9]+}/status', async (c) => {
     .first<{ status: string; division_id: number; project_id: number | null; assignee_id: number | null; required_proof_type: string | null }>()
   if (!task) throw new HTTPException(404, { message: 'No such task' })
 
-  // The assignee ticks it; an unassigned task, anyone in its tab.
-  if (task.assignee_id === null) {
-    await assertMember(c.env.DB, task.project_id ? 'project' : 'division', task.project_id ?? task.division_id, me)
-  } else if (task.assignee_id !== me) {
+  // Only in a tab the viewer can see; then the assignee ticks it, or anyone if it's unassigned.
+  await assertMember(c.env.DB, task.project_id ? 'project' : 'division', task.project_id ?? task.division_id, me)
+  if (task.assignee_id !== null && task.assignee_id !== me) {
     throw new HTTPException(403, { message: 'Only the assignee can change this task' })
   }
 
