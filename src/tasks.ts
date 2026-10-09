@@ -9,10 +9,13 @@ const DB_STATUS: Record<string, string> = Object.fromEntries(Object.entries(STAT
 
 /**
  * The checkbox rules (arcbyte decisions 0004 and 0005): what else to set for
- * `from → to`, or null when the move is not allowed.
+ * `from → to`, or null when the move is not allowed. Task Detail's "start
+ * working" moves an untouched task to in progress (decision 0008); the
+ * checkbox itself never does.
  */
 function teamMove(from: string, to: string, needsReview: boolean): string | null {
   const open = from === 'waiting' || from === 'in_progress'
+  if (from === 'waiting' && to === 'in_progress') return "start_date = coalesce(start_date, datetime('now'))"
   if (open && to === 'done' && !needsReview) return "completed_date = datetime('now')"
   if (open && to === 'review' && needsReview) return "review_date = datetime('now')"
   if (from === 'done' && to === 'waiting') return 'completed_date = null, review_date = null'
@@ -20,6 +23,7 @@ function teamMove(from: string, to: string, needsReview: boolean): string | null
 }
 
 function personalMove(from: string, to: string): string | null {
+  if (from === 'todo' && to === 'in_progress') return ''
   if ((from === 'todo' || from === 'in_progress') && to === 'done') return "completed_at = datetime('now')"
   if (from === 'done' && to === 'todo') return 'completed_at = null'
   return null
@@ -333,7 +337,7 @@ tasks.patch('/personal-tasks/:id{[0-9]+}/status', async (c) => {
   const also = personalMove(task.status, to)
   if (also === null) throw notAllowed(task.status, to)
   const row = await c.env.DB.prepare(
-    `update personal_tasks set status = ?1, ${also}, updated_at = datetime('now')
+    `update personal_tasks set status = ?1, ${also ? also + ', ' : ''}updated_at = datetime('now')
      where id = ?2 and status = ?3 returning ${PERSONAL_TASK_COLUMNS}`,
   )
     .bind(to, c.req.param('id'), task.status)
