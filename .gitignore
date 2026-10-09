@@ -31,3 +31,7 @@ lerna-debug.log*
 
 # misc
 .DS_Store
+
+# real users: never commit (scripts/users-sql.ts)
+users.json
+users.sql
