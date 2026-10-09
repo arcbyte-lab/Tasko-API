@@ -35,9 +35,11 @@ describe('team task detail', () => {
     expect((await flags('/tasks/20')).canArchive, 'she created it').toBe(true)
   })
 
-  it('on tasko-app, where Mira is a member, she only asks for extensions', async () => {
-    await setStatus(2, 'review')
+  it('on tasko-app, where Mira is a member, she only asks for extensions, and only while the task is open', async () => {
     expect(await flags('/tasks/2')).toEqual({ canReview: false, canArchive: false, canRequestExtension: true })
+    expect((await flags('/tasks/4')).canRequestExtension, 'done').toBe(false)
+    await setStatus(2, 'review')
+    expect(await flags('/tasks/2')).toEqual({ canReview: false, canArchive: false, canRequestExtension: false })
     expect((await flags('/tasks/2', await login('ana@arcbyte.dev'))).canReview, 'person-in-charge').toBe(true)
   })
 
@@ -76,8 +78,14 @@ describe('comments', () => {
     expect((await detail('/tasks/1')).comments.map((c: any) => c.body)).toEqual(['On it.'])
   })
 
+  it('shows a comment with no text as an empty string', async () => {
+    await env.DB.prepare("insert into comments (task_id, user_id, comment, created_at, updated_at) values (1, 2, null, datetime('now'), datetime('now'))").run()
+    expect((await detail('/tasks/1')).comments.map((c: any) => c.body)).toEqual([''])
+  })
+
   it('rejects an empty body, a personal task and an outsider', async () => {
     expect((await comment('/tasks/1', '  ')).status).toBe(400)
+    expect((await api(mira, '/tasks/1/comments', { method: 'POST', body: 'null' })).status, 'null body').toBe(400)
     expect((await comment('/personal-tasks/1', 'hi')).status).toBe(404)
     await env.DB.prepare('delete from project_members where project_id = 1 and user_id = 1').run()
     expect((await comment('/tasks/1', 'hi')).status).toBe(403)

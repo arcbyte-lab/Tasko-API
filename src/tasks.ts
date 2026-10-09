@@ -1,7 +1,7 @@
 import { Hono, type Context } from 'hono'
 import { HTTPException } from 'hono/http-exception'
 import type { AppEnv } from './auth'
-import { assertMember, iso, PERSONAL_TASK_COLUMNS, STATUS, type TaskRow, TEAM_TASK_COLUMNS, toTask } from './tabs'
+import { assertMember, iso, PERSONAL_TASK_COLUMNS, STATUS, TEAM_TASK_COLUMNS, toTask, type TaskRow } from './tabs'
 
 /** The app sends the Dart enum name; the database holds the snake_case value. */
 const DB_STATUS: Record<string, string> = Object.fromEntries(Object.entries(STATUS).map(([db, app]) => [app, db]))
@@ -310,13 +310,14 @@ tasks.get('/tasks/:id{[0-9]+}/detail', async (c) => {
     c.env.DB.prepare(`select name from ${tab.kind === 'project' ? 'projects' : 'divisions'} where id = ?`).bind(tab.id).first<string>('name'),
     c.env.DB.prepare(`select ${TEAM_TASK_COLUMNS} from tasks where parent_id = ? order by created_at, id`).bind(c.req.param('id')).all<TaskRow>(),
     c.env.DB.prepare(
-      `select u.id, u.name, c.comment body, c.created_at from comments c join users u on u.id = c.user_id
+      `select u.id, u.name, coalesce(c.comment, '') body, c.created_at from comments c join users u on u.id = c.user_id
        where c.task_id = ? and c.deleted_at is null order by c.created_at, c.id`,
     )
       .bind(c.req.param('id'))
       .all<{ id: number; name: string; body: string; created_at: string }>(),
     task.assignee_id === null ? null : c.env.DB.prepare('select id, name from users where id = ?').bind(task.assignee_id).first(),
-    isReviewer(c.env.DB, task, me),
+    // Only the review and extension flags read it, so skip the query when neither can be true.
+    task.status === 'review' || task.assignee_id === me ? isReviewer(c.env.DB, task, me) : false,
   ])
   return c.json({
     tab: { kind: tab.kind, id: tab.id, name: tabRow },
@@ -325,12 +326,13 @@ tasks.get('/tasks/:id{[0-9]+}/detail', async (c) => {
     assignee,
     canReview: task.status === 'review' && reviewer,
     canArchive: task.creator_id === me,
-    canRequestExtension: task.assignee_id === me && !reviewer,
+    // Only open tasks can be overdue (decision 0004).
+    canRequestExtension: task.assignee_id === me && !reviewer && (task.status === 'waiting' || task.status === 'in_progress'),
   })
 })
 
 tasks.get('/personal-tasks/:id{[0-9]+}/detail', async (c) => {
-  await assertOwnPersonalTask(c)
+  await ownPersonalTask(c)
   const { results } = await c.env.DB.prepare(`select ${PERSONAL_TASK_COLUMNS} from personal_tasks where parent_id = ? order by created_at, id`)
     .bind(c.req.param('id'))
     .all<TaskRow>()
@@ -347,7 +349,7 @@ tasks.get('/personal-tasks/:id{[0-9]+}/detail', async (c) => {
 
 tasks.post('/tasks/:id{[0-9]+}/comments', async (c) => {
   await teamTask(c)
-  const { body } = await c.req.json<{ body?: unknown }>().catch(() => ({}) as { body?: unknown })
+  const { body } = await readBody(c)
   if (typeof body !== 'string' || !body.trim()) throw bad('body must be a non-empty string')
   const user = c.get('user')
   const createdAt = await c.env.DB.prepare(
