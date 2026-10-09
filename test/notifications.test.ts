@@ -28,9 +28,10 @@ describe('producers', () => {
   })
 
   it('re-assigning on edit notifies the new assignee once', async () => {
-    await send('PATCH', '/tasks/2', { assigneeId: 4 })
-    await send('PATCH', '/tasks/2', { assigneeId: 4, name: 'Port theme tokens again' })
-    expect((await rows()).map((r) => [r.type, r.notifiable_id])).toEqual([['task_assigned', 4]])
+    const ana = await login('ana@arcbyte.dev') // task 2's creator: only the creator or a reviewer reassigns
+    await send('PATCH', '/tasks/2', { assigneeId: 4 }, ana)
+    await send('PATCH', '/tasks/2', { assigneeId: 4, name: 'Port theme tokens again' }, ana)
+    expect((await rows()).map((r) => [r.type, r.notifiable_id, r.data.actorId])).toEqual([['task_assigned', 4, 2]])
   })
 
   it('sending a task to review notifies every reviewer but the actor', async () => {
@@ -42,6 +43,15 @@ describe('producers', () => {
     await env.DB.prepare("update division_members set role_type = 'supervisor' where user_id = 4").run()
     await send('PATCH', '/tasks/23/status', { status: 'review' })
     expect((await rows()).slice(1).map((r) => r.notifiable_id).sort()).toEqual([2, 4])
+  })
+
+  it('an author who left the project is no longer a reviewer to notify', async () => {
+    await env.DB.batch([
+      env.DB.prepare('update tasks set assignee_id = 3 where id = 5'), // Budi's now
+      env.DB.prepare('delete from project_members where project_id = 2 and user_id = 1'), // Mira, tasko-web's author, leaves
+    ])
+    expect((await send('PATCH', '/tasks/5/status', { status: 'review' }, await login('budi@arcbyte.dev'))).status).toBe(200)
+    expect((await rows()).map((r) => r.notifiable_id)).toEqual([2])
   })
 
   it('a review decision notifies the assignee', async () => {
