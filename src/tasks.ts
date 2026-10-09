@@ -44,6 +44,13 @@ const notAllowed = (from: string, to: string) => new HTTPException(422, { messag
 const changedMeanwhile = () => new HTTPException(409, { message: 'The task changed meanwhile; reload it' })
 const noAssignee = () => new HTTPException(422, { message: 'A personal task has no assignee' })
 
+/** An ISO 8601 string as D1's UTC datetime, `YYYY-MM-DD HH:MM:SS`. */
+function dbDate(value: unknown, field: string) {
+  const date = parseDue(value)
+  if (!date) throw bad(`${field} must be an ISO 8601 date`)
+  return date.toISOString().slice(0, 19).replace('T', ' ')
+}
+
 type Fields = { name?: string; description?: string | null; priority?: number; dueDate?: string | null; assigneeId?: number | null }
 
 /** A strict ISO 8601 date or date-time, or null; `new Date` alone takes 'March 5' and rolls Feb 30 into March. */
@@ -74,11 +81,7 @@ async function readFields(c: Context<AppEnv>, required: (keyof Fields)[]): Promi
     if (typeof p !== 'number' || !Number.isInteger(p) || p < 1 || p > 4) throw bad('priority must be 1 to 4')
     f.priority = p
   }
-  if ('dueDate' in body) {
-    const due = parseDue(body.dueDate)
-    if (body.dueDate !== null && !due) throw bad('dueDate must be an ISO 8601 date or null')
-    f.dueDate = due && due.toISOString().slice(0, 19).replace('T', ' ') // D1's UTC datetime format
-  }
+  if ('dueDate' in body) f.dueDate = body.dueDate === null ? null : dbDate(body.dueDate, 'dueDate')
   if ('assigneeId' in body) {
     if (body.assigneeId !== null && !Number.isInteger(body.assigneeId)) throw bad('assigneeId must be a user id or null')
     f.assigneeId = body.assigneeId as number | null
@@ -106,9 +109,11 @@ const tabOf = (t: TeamTask) =>
 
 /** A team task in one of the viewer's tabs: 404 if missing, 403 if outside them. */
 async function teamTask(c: Context<AppEnv>) {
-  const task = await c.env.DB.prepare('select division_id, project_id, assignee_id, creator_id, status, required_proof_type from tasks where id = ?')
+  const task = await c.env.DB.prepare(
+    'select division_id, project_id, assignee_id, creator_id, status, required_proof_type, due_date from tasks where id = ?',
+  )
     .bind(c.req.param('id'))
-    .first<TeamTask & { creator_id: number; status: string; required_proof_type: string | null }>()
+    .first<TeamTask & { creator_id: number; status: string; required_proof_type: string | null; due_date: string | null }>()
   if (!task) throw new HTTPException(404, { message: 'No such task' })
   const tab = tabOf(task)
   await assertMember(c.env.DB, tab.kind, tab.id, c.get('user').id)
@@ -366,4 +371,59 @@ tasks.post('/tasks/:id{[0-9]+}/comments', async (c) => {
     .bind(c.req.param('id'), user.id, body.trim())
     .first<string>('created_at')
   return c.json({ author: { id: user.id, name: user.name }, body: body.trim(), createdAt: iso(createdAt!) }, 201)
+})
+
+/** Approve → done, reject → back to in progress (decision 0004). The first decision wins (decision 0005). */
+tasks.post('/tasks/:id{[0-9]+}/reviews', async (c) => {
+  const me = c.get('user').id
+  const task = await teamTask(c)
+  if (!(await isReviewer(c.env.DB, task, me))) throw new HTTPException(403, { message: 'Only a reviewer can decide this task' })
+  const { approve, reason } = await readBody(c)
+  if (typeof approve !== 'boolean') throw bad('approve must be true or false')
+  if (reason != null && typeof reason !== 'string') throw bad('reason must be a string')
+
+  const id = c.req.param('id')
+  const also = approve ? "completed_date = datetime('now')" : 'completed_date = null, review_date = null'
+  // One transaction: the status moves only out of review, and the review row is
+  // written only if it did (changes() is the update's row count).
+  const [updated] = await c.env.DB.batch<TaskRow>([
+    c.env.DB.prepare(
+      `update tasks set status = ?1, ${also}, updated_at = datetime('now') where id = ?2 and status = 'review' returning ${TEAM_TASK_COLUMNS}`,
+    ).bind(approve ? 'done' : 'in_progress', id),
+    c.env.DB.prepare(
+      `insert into task_reviews (task_id, reviewer_id, decision, reason, created_at, updated_at)
+       select ?, ?, ?, ?, datetime('now'), datetime('now') where changes() = 1`,
+    ).bind(id, me, approve ? 'approved' : 'rejected', reason?.trim() || null),
+  ])
+  if (!updated.results.length) throw new HTTPException(409, { message: 'This task is not waiting for review' })
+  return c.json(toTask(updated.results[0]))
+})
+
+tasks.post('/tasks/:id{[0-9]+}/deadline-requests', async (c) => {
+  const me = c.get('user').id
+  const task = await teamTask(c)
+  if (task.assignee_id !== me || (await isReviewer(c.env.DB, task, me))) {
+    throw new HTTPException(403, { message: 'Only the assignee, when not a reviewer, can ask for more time' })
+  }
+  const body = await readBody(c)
+  const newDue = dbDate(body.newDue, 'newDue')
+  if (typeof body.reason !== 'string' || !body.reason.trim()) throw bad('reason must be a non-empty string')
+  // Only open tasks can be overdue (decision 0004), and an extension moves the date later.
+  if (task.status !== 'waiting' && task.status !== 'in_progress') throw new HTTPException(422, { message: 'Only an open task can get more time' })
+  if (newDue <= (task.due_date ?? dbDate(new Date().toISOString(), 'now'))) {
+    throw new HTTPException(422, { message: 'newDue must be later than the current due date' })
+  }
+  // One pending request per task; the guard is in the insert so a double tap can't add a second.
+  const { meta } = await c.env.DB.prepare(
+    `insert into task_deadline_requests (task_id, requester_id, current_due_date, requested_due_date, reason, status, created_at, updated_at)
+     select id, ?2, due_date, ?3, ?4, 'pending', datetime('now'), datetime('now') from tasks
+     where id = ?1 and not exists (select 1 from task_deadline_requests where task_id = ?1 and status = 'pending')`,
+  )
+    .bind(c.req.param('id'), me, newDue, body.reason.trim())
+    .run()
+  if (!meta.changes) {
+    const gone = !(await c.env.DB.prepare('select 1 from tasks where id = ?').bind(c.req.param('id')).first())
+    throw gone ? new HTTPException(404, { message: 'No such task' }) : new HTTPException(409, { message: 'A request for this task is already pending' })
+  }
+  return c.body(null, 204)
 })
