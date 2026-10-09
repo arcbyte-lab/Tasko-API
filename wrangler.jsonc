@@ -7,8 +7,7 @@
     {
       "binding": "DB",
       "database_name": "tasko",
-      // Placeholder until `wrangler d1 create tasko` is run for the real account.
-      "database_id": "00000000-0000-0000-0000-000000000000"
+      "database_id": "88d7efc3-8502-4361-9ab9-c3a2605ff90f"
     }
   ]
 }
