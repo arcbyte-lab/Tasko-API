@@ -211,9 +211,14 @@ tasks.patch('/tasks/:id{[0-9]+}', async (c) => {
   const tab = tabOf(task)
   await assertAssignable(c.env.DB, tab.kind, tab.id, f.assigneeId)
   const set = setClause(f, false)
-  const row = (await c.env.DB.prepare(`update tasks set ${set.sql} where id = ? returning ${TEAM_TASK_COLUMNS}`)
-    .bind(...set.values, c.req.param('id'))
-    .first<TaskRow>())!
+  // A reassignment only applies over the assignee read above, so two at once can't both notify.
+  const reassign = 'assigneeId' in f
+  const row = await c.env.DB.prepare(
+    `update tasks set ${set.sql} where id = ?${reassign ? ' and assignee_id is ?' : ''} returning ${TEAM_TASK_COLUMNS}`,
+  )
+    .bind(...set.values, c.req.param('id'), ...(reassign ? [task.assignee_id] : []))
+    .first<TaskRow>()
+  if (!row) throw changedMeanwhile()
   if (row.assignee_id !== null && row.assignee_id !== task.assignee_id) {
     await notify(c.env.DB, [row.assignee_id], 'task_assigned', { taskId: row.id, taskName: row.name, actorId: c.get('user').id })
   }
@@ -257,6 +262,8 @@ tasks.post('/tasks/:id{[0-9]+}/subtasks', async (c) => {
     },
     { name },
   )
+  const me = c.get('user').id
+  if (row!.assignee_id !== null) await notify(c.env.DB, [row!.assignee_id], 'task_assigned', { taskId: row!.id, taskName: row!.name, actorId: me })
   return c.json(toTask(row!), 201)
 })
 
@@ -313,17 +320,19 @@ tasks.patch('/personal-tasks/:id{[0-9]+}/status', async (c) => {
  * The author counts only while still a member (decision 0002). A reviewer may
  * review their own task.
  */
-async function reviewersOf(db: D1Database, task: TeamTask) {
+/** The task's reviewers, or with [only], just that user if they are one. */
+async function reviewersOf(db: D1Database, task: TeamTask, only: number | null = null) {
   const tab = tabOf(task)
   const sql =
     tab.kind === 'project'
       ? `select m.user_id id from project_members m join projects p on p.id = m.project_id
          where m.project_id = ?1 and (m.role = 'person-in-charge' or m.user_id = p.creator_id)`
       : `select user_id id from division_members where division_id = ?1 and role_type in ('admin', 'supervisor')`
-  return (await db.prepare(sql).bind(tab.id).all<{ id: number }>()).results.map((r) => r.id)
+  const { results } = await db.prepare(`select id from (${sql}) where ?2 is null or id = ?2`).bind(tab.id, only).all<{ id: number }>()
+  return results.map((r) => r.id)
 }
 
-const isReviewer = async (db: D1Database, task: TeamTask, userId: number) => (await reviewersOf(db, task)).includes(userId)
+const isReviewer = async (db: D1Database, task: TeamTask, userId: number) => (await reviewersOf(db, task, userId)).length > 0
 
 tasks.get('/tasks/:id{[0-9]+}/detail', async (c) => {
   const me = c.get('user').id

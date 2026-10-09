@@ -50,9 +50,24 @@ describe('producers', () => {
     expect(await rows()).toEqual([
       { type: 'task_reviewed', notifiable_type: 'user', notifiable_id: 3, data: { taskId: 7, taskName: 'Review PR #42', actorId: 2, approved: false } },
     ])
-    expect((await bell(await login('budi@arcbyte.dev')))[0].text).toBe('Ana declined Review PR #42')
+    expect((await bell(await login('budi@arcbyte.dev')))[0].text).toBe('Ana rejected Review PR #42')
     await send('POST', '/tasks/12/reviews', { approve: true }) // Mira reviews her own task: nobody to tell
     expect(await rows()).toHaveLength(1)
+  })
+
+  it('a new sub-task notifies the assignee it inherits', async () => {
+    await send('POST', '/tasks/7/subtasks', { name: 'Check CI' }) // the parent is assigned to Budi
+    expect((await rows()).map((r) => [r.type, r.notifiable_id, r.data.taskName])).toEqual([['task_assigned', 3, 'Check CI']])
+  })
+
+  it('a failed notification write does not fail the change', async () => {
+    await env.DB.prepare('alter table notifications rename to notifications_off').run()
+    try {
+      expect((await send('POST', '/tabs/project/1/tasks', { name: 'Ship beta', priority: 2, assigneeId: 3 })).status).toBe(201)
+    } finally {
+      await env.DB.prepare('alter table notifications_off rename to notifications').run()
+    }
+    expect(await rows()).toEqual([])
   })
 
   it('a 409 review writes nothing', async () => {
@@ -83,7 +98,28 @@ describe('the bell', () => {
     expect(after[1].readAt).toBeNull()
     const [budis] = await bell(await login('budi@arcbyte.dev'))
     expect((await api(mira, `/notifications/${budis.id}/read`, { method: 'POST' })).status).toBe(404)
-    expect(older.id).not.toBe(budis.id)
+    expect((await bell(await login('budi@arcbyte.dev')))[0].readAt, 'Budi’s stays unread').toBeNull()
+    expect(older.readAt).toBeNull()
+  })
+
+  it('shows an unknown type, even an Object key, as the type itself', async () => {
+    await env.DB.prepare(
+      `insert into notifications (id, type, notifiable_type, notifiable_id, data, created_at, updated_at)
+       values ('x', 'toString', 'user', 1, '{"actorId":2}', datetime('now', '+1 minute'), datetime('now'))`,
+    ).run()
+    expect((await bell(mira))[0].text).toBe('toString')
+  })
+
+  it('shows the newest 100', async () => {
+    await env.DB.batch(
+      Array.from({ length: 105 }, (_, i) =>
+        env.DB.prepare(
+          `insert into notifications (id, type, notifiable_type, notifiable_id, data, created_at, updated_at)
+           values (?, 'task_assigned', 'user', 1, '{"actorId":2,"taskName":"t"}', datetime('now'), datetime('now'))`,
+        ).bind(`n${i}`),
+      ),
+    )
+    expect(await bell(mira)).toHaveLength(100)
   })
 
   it('marks all of the viewer’s read, and nobody else’s', async () => {
