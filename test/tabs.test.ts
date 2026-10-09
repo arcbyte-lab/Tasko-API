@@ -30,7 +30,7 @@ it('private holds only the viewer’s top-level personal tasks, mapped to the Ta
     'Buy domain', 'Renew passport', 'Book dentist', 'Pay internet bill', 'Read Flutter release notes', 'Buy groceries',
   ])
   expect(tasks[0]).toMatchObject({ personal: true, status: 'todo', priority: 'medium', code: null, assigneeId: null, parentId: null })
-  expect(tasks[0].dueDate).toMatch(/^\d{4}-\d\d-\d\dT00:00:00Z$/)
+  expect(tasks[0].dueDate).toMatch(/^\d{4}-\d\d-\d\dT17:00:00Z$/) // local (UTC+7) midnight
   expect(await json('/tabs/private/0/tasks', await login('ana@arcbyte.dev'))).toEqual([])
 })
 
@@ -46,7 +46,7 @@ it('a project tab holds its top-level tasks', async () => {
   expect(web[0]).toMatchObject({
     code: 'TW-0041', status: 'inProgress', priority: 'urgent', requiredProofType: 'image', assigneeId: 1,
   })
-  expect(web[0].dueDate).toMatch(/T17:00:00Z$/)
+  expect(web[0].dueDate).toMatch(/T10:00:00Z$/) // 17:00 local
   expect((await json('/tabs/project/1/tasks')).map((t: any) => t.code)).toEqual(['TA-0011', 'TA-0012', 'TA-0013', 'TA-0014'])
 })
 
