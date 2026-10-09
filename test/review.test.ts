@@ -51,6 +51,7 @@ describe('reviews', () => {
   it('a task not in review is 409, and a bad body 400', async () => {
     expect((await post('/tasks/5/reviews', { approve: true })).status).toBe(409)
     expect((await post('/tasks/12/reviews', { approve: 'yes' })).status).toBe(400)
+    expect((await post('/tasks/12/reviews', null)).status, 'null body').toBe(400)
   })
 })
 
@@ -72,6 +73,8 @@ describe('deadline requests', () => {
 
   it('needs a date and a reason', async () => {
     expect((await post('/tasks/1/deadline-requests', { newDue: 'later', reason: 'x' })).status).toBe(400)
+    expect((await post('/tasks/1/deadline-requests', { newDue: '2026-02-30', reason: 'x' })).status, 'no such day').toBe(400)
+    expect((await post('/tasks/1/deadline-requests', null)).status, 'null body').toBe(400)
     expect((await post('/tasks/1/deadline-requests', { newDue: '2026-12-01T10:00:00Z' })).status).toBe(400)
   })
 })

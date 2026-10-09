@@ -375,7 +375,7 @@ tasks.post('/tasks/:id{[0-9]+}/comments', async (c) => {
 tasks.post('/tasks/:id{[0-9]+}/reviews', async (c) => {
   const me = c.get('user').id
   const task = await teamTask(c)
-  const { approve, reason } = await c.req.json<{ approve?: unknown; reason?: unknown }>().catch(() => ({}) as Record<string, unknown>)
+  const { approve, reason } = await readBody(c)
   if (typeof approve !== 'boolean') throw bad('approve must be true or false')
   if (reason != null && typeof reason !== 'string') throw bad('reason must be a string')
   if (!(await isReviewer(c.env.DB, task, me))) throw new HTTPException(403, { message: 'Only a reviewer can decide this task' })
@@ -400,7 +400,7 @@ tasks.post('/tasks/:id{[0-9]+}/reviews', async (c) => {
 tasks.post('/tasks/:id{[0-9]+}/deadline-requests', async (c) => {
   const me = c.get('user').id
   const task = await teamTask(c)
-  const body = await c.req.json<{ newDue?: unknown; reason?: unknown }>().catch(() => ({}) as Record<string, unknown>)
+  const body = await readBody(c)
   const newDue = dbDate(body.newDue, 'newDue')
   if (typeof body.reason !== 'string' || !body.reason.trim()) throw bad('reason must be a non-empty string')
   if (task.assignee_id !== me || (await isReviewer(c.env.DB, task, me))) {
