@@ -109,9 +109,11 @@ const tabOf = (t: TeamTask) =>
 
 /** A team task in one of the viewer's tabs: 404 if missing, 403 if outside them. */
 async function teamTask(c: Context<AppEnv>) {
-  const task = await c.env.DB.prepare('select division_id, project_id, assignee_id, creator_id, status, required_proof_type from tasks where id = ?')
+  const task = await c.env.DB.prepare(
+    'select division_id, project_id, assignee_id, creator_id, status, required_proof_type, due_date from tasks where id = ?',
+  )
     .bind(c.req.param('id'))
-    .first<TeamTask & { creator_id: number; status: string; required_proof_type: string | null }>()
+    .first<TeamTask & { creator_id: number; status: string; required_proof_type: string | null; due_date: string | null }>()
   if (!task) throw new HTTPException(404, { message: 'No such task' })
   const tab = tabOf(task)
   await assertMember(c.env.DB, tab.kind, tab.id, c.get('user').id)
@@ -371,17 +373,17 @@ tasks.post('/tasks/:id{[0-9]+}/comments', async (c) => {
   return c.json({ author: { id: user.id, name: user.name }, body: body.trim(), createdAt: iso(createdAt!) }, 201)
 })
 
-/** Approve → done, decline → back to in progress. The first decision wins (decision 0005). */
+/** Approve → done, reject → back to in progress (decision 0004). The first decision wins (decision 0005). */
 tasks.post('/tasks/:id{[0-9]+}/reviews', async (c) => {
   const me = c.get('user').id
   const task = await teamTask(c)
+  if (!(await isReviewer(c.env.DB, task, me))) throw new HTTPException(403, { message: 'Only a reviewer can decide this task' })
   const { approve, reason } = await readBody(c)
   if (typeof approve !== 'boolean') throw bad('approve must be true or false')
   if (reason != null && typeof reason !== 'string') throw bad('reason must be a string')
-  if (!(await isReviewer(c.env.DB, task, me))) throw new HTTPException(403, { message: 'Only a reviewer can decide this task' })
 
   const id = c.req.param('id')
-  const also = approve ? "completed_date = datetime('now')" : 'completed_date = null'
+  const also = approve ? "completed_date = datetime('now')" : 'completed_date = null, review_date = null'
   // One transaction: the status moves only out of review, and the review row is
   // written only if it did (changes() is the update's row count).
   const [updated] = await c.env.DB.batch<TaskRow>([
@@ -391,7 +393,7 @@ tasks.post('/tasks/:id{[0-9]+}/reviews', async (c) => {
     c.env.DB.prepare(
       `insert into task_reviews (task_id, reviewer_id, decision, reason, created_at, updated_at)
        select ?, ?, ?, ?, datetime('now'), datetime('now') where changes() = 1`,
-    ).bind(id, me, approve ? 'approved' : 'declined', reason || null),
+    ).bind(id, me, approve ? 'approved' : 'rejected', reason?.trim() || null),
   ])
   if (!updated.results.length) throw new HTTPException(409, { message: 'This task is not waiting for review' })
   return c.json(toTask(updated.results[0]))
@@ -400,17 +402,28 @@ tasks.post('/tasks/:id{[0-9]+}/reviews', async (c) => {
 tasks.post('/tasks/:id{[0-9]+}/deadline-requests', async (c) => {
   const me = c.get('user').id
   const task = await teamTask(c)
-  const body = await readBody(c)
-  const newDue = dbDate(body.newDue, 'newDue')
-  if (typeof body.reason !== 'string' || !body.reason.trim()) throw bad('reason must be a non-empty string')
   if (task.assignee_id !== me || (await isReviewer(c.env.DB, task, me))) {
     throw new HTTPException(403, { message: 'Only the assignee, when not a reviewer, can ask for more time' })
   }
-  await c.env.DB.prepare(
+  const body = await readBody(c)
+  const newDue = dbDate(body.newDue, 'newDue')
+  if (typeof body.reason !== 'string' || !body.reason.trim()) throw bad('reason must be a non-empty string')
+  // Only open tasks can be overdue (decision 0004), and an extension moves the date later.
+  if (task.status !== 'waiting' && task.status !== 'in_progress') throw new HTTPException(422, { message: 'Only an open task can get more time' })
+  if (newDue <= (task.due_date ?? dbDate(new Date().toISOString(), 'now'))) {
+    throw new HTTPException(422, { message: 'newDue must be later than the current due date' })
+  }
+  // One pending request per task; the guard is in the insert so a double tap can't add a second.
+  const { meta } = await c.env.DB.prepare(
     `insert into task_deadline_requests (task_id, requester_id, current_due_date, requested_due_date, reason, status, created_at, updated_at)
-     select id, ?2, due_date, ?3, ?4, 'pending', datetime('now'), datetime('now') from tasks where id = ?1`,
+     select id, ?2, due_date, ?3, ?4, 'pending', datetime('now'), datetime('now') from tasks
+     where id = ?1 and not exists (select 1 from task_deadline_requests where task_id = ?1 and status = 'pending')`,
   )
     .bind(c.req.param('id'), me, newDue, body.reason.trim())
     .run()
+  if (!meta.changes) {
+    const gone = !(await c.env.DB.prepare('select 1 from tasks where id = ?').bind(c.req.param('id')).first())
+    throw gone ? new HTTPException(404, { message: 'No such task' }) : new HTTPException(409, { message: 'A request for this task is already pending' })
+  }
   return c.body(null, 204)
 })

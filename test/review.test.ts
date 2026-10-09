@@ -21,10 +21,17 @@ describe('reviews', () => {
     expect(await reviews()).toEqual([{ task_id: 12, reviewer_id: 1, decision: 'approved', reason: null }])
   })
 
-  it('decline: back to in progress, with the reason', async () => {
-    const task = (await (await post('/tasks/12/reviews', { approve: false, reason: 'Missing the mobile pass' })).json()) as any
+  it('reject: back to in progress, review_date cleared, with the trimmed reason', async () => {
+    await env.DB.prepare("update tasks set review_date = datetime('now') where id = 12").run()
+    const task = (await (await post('/tasks/12/reviews', { approve: false, reason: ' Missing the mobile pass ' })).json()) as any
     expect(task).toMatchObject({ status: 'inProgress', completedAt: null })
-    expect(await reviews()).toEqual([{ task_id: 12, reviewer_id: 1, decision: 'declined', reason: 'Missing the mobile pass' }])
+    expect(await reviews()).toEqual([{ task_id: 12, reviewer_id: 1, decision: 'rejected', reason: 'Missing the mobile pass' }])
+    expect((await env.DB.prepare('select review_date from tasks where id = 12').first())!.review_date).toBeNull()
+  })
+
+  it('a blank reason is stored as null', async () => {
+    await post('/tasks/12/reviews', { approve: false, reason: '   ' })
+    expect((await reviews())[0].reason).toBeNull()
   })
 
   it('the first decision wins: a second reviewer gets 409 and writes no row', async () => {
@@ -45,6 +52,7 @@ describe('reviews', () => {
     await env.DB.prepare("update tasks set status = 'review' where id = 2").run() // tasko-app, Mira is a member
     expect((await post('/tasks/2/reviews', { approve: true })).status).toBe(403)
     expect((await post('/tasks/12/reviews', { approve: true }, await login('budi@arcbyte.dev'))).status).toBe(403)
+    expect((await post('/tasks/12/reviews', { approve: 'yes' }, await login('budi@arcbyte.dev'))).status, 'before the body').toBe(403)
     expect(await reviews()).toEqual([])
   })
 
@@ -57,24 +65,33 @@ describe('reviews', () => {
 
 describe('deadline requests', () => {
   it('the assignee asks for more time: a pending row with the current due date', async () => {
-    const res = await post('/tasks/1/deadline-requests', { newDue: '2026-12-01T10:00:00Z', reason: 'Waiting on runners' })
+    const res = await post('/tasks/1/deadline-requests', { newDue: '2099-12-01T10:00:00Z', reason: 'Waiting on runners' })
     expect(res.status).toBe(204)
     const row = await env.DB.prepare('select r.*, t.due_date from task_deadline_requests r join tasks t on t.id = r.task_id').first<any>()
     expect(row).toMatchObject({
-      task_id: 1, requester_id: 1, requested_due_date: '2026-12-01 10:00:00', reason: 'Waiting on runners', status: 'pending',
+      task_id: 1, requester_id: 1, requested_due_date: '2099-12-01 10:00:00', reason: 'Waiting on runners', status: 'pending',
     })
     expect(row.current_due_date).toBe(row.due_date)
   })
 
+  it('only for an open task, one pending at a time, and only to a later date', async () => {
+    await env.DB.prepare("update tasks set status = 'done' where id = 2").run()
+    expect((await post('/tasks/2/deadline-requests', { newDue: '2099-12-01T10:00:00Z', reason: 'x' })).status, 'done').toBe(422)
+    expect((await post('/tasks/1/deadline-requests', { newDue: '2020-01-01', reason: 'x' })).status, 'earlier').toBe(422)
+    expect((await post('/tasks/1/deadline-requests', { newDue: '2099-12-01T10:00:00Z', reason: 'x' })).status).toBe(204)
+    expect((await post('/tasks/1/deadline-requests', { newDue: '2099-12-02T10:00:00Z', reason: 'x' })).status, 'pending').toBe(409)
+    expect((await env.DB.prepare('select count(*) n from task_deadline_requests').first())!.n).toBe(1)
+  })
+
   it('is 403 for a reviewer or someone who is not the assignee', async () => {
-    expect((await post('/tasks/5/deadline-requests', { newDue: '2026-12-01T10:00:00Z', reason: 'x' })).status, 'reviewer').toBe(403)
-    expect((await post('/tasks/1/deadline-requests', { newDue: '2026-12-01T10:00:00Z', reason: 'x' }, await login('budi@arcbyte.dev'))).status).toBe(403)
+    expect((await post('/tasks/5/deadline-requests', { newDue: '2099-12-01T10:00:00Z', reason: 'x' })).status, 'reviewer').toBe(403)
+    expect((await post('/tasks/1/deadline-requests', { newDue: '2099-12-01T10:00:00Z', reason: 'x' }, await login('budi@arcbyte.dev'))).status).toBe(403)
   })
 
   it('needs a date and a reason', async () => {
     expect((await post('/tasks/1/deadline-requests', { newDue: 'later', reason: 'x' })).status).toBe(400)
     expect((await post('/tasks/1/deadline-requests', { newDue: '2026-02-30', reason: 'x' })).status, 'no such day').toBe(400)
     expect((await post('/tasks/1/deadline-requests', null)).status, 'null body').toBe(400)
-    expect((await post('/tasks/1/deadline-requests', { newDue: '2026-12-01T10:00:00Z' })).status).toBe(400)
+    expect((await post('/tasks/1/deadline-requests', { newDue: '2099-12-01T10:00:00Z' })).status).toBe(400)
   })
 })
