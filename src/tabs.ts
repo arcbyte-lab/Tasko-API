@@ -7,8 +7,13 @@ type Kind = 'private' | 'division' | 'project'
 const STATUS: Record<string, string> = { todo: 'todo', waiting: 'waiting', in_progress: 'inProgress', review: 'review', done: 'done' }
 const PRIORITY = ['low', 'medium', 'high', 'urgent']
 
-/** D1 stores UTC as `YYYY-MM-DD HH:MM:SS`; the app wants ISO 8601. */
-const iso = (d: string | null) => (d ? `${d.replace(' ', 'T')}Z` : null)
+/** D1 stores UTC as `YYYY-MM-DD HH:MM:SS`; the app wants ISO 8601. A bare date is midnight UTC. */
+const iso = (d: string | null) => {
+  if (!d) return null
+  const s = d.replace(' ', 'T')
+  if (!s.includes('T')) return `${s}T00:00:00Z`
+  return /(Z|[+-]\d\d:\d\d)$/.test(s) ? s : `${s}Z`
+}
 
 export type TaskRow = {
   id: number
@@ -46,15 +51,24 @@ export const TEAM_TASK_COLUMNS = `id, name, status, priority_level, due_date, de
 export const PERSONAL_TASK_COLUMNS = `id, title name, status, priority_level, due_date, note description, null assignee_id,
   null required_proof_type, 1 personal, null code, parent_id, completed_at`
 
-/** Throws 403 unless the viewer belongs to the division or project. */
+// The tabs the viewer (?1) sees. GET /tabs and assertMember share these, so a hidden tab can't be opened by id.
+const VISIBLE_DIVISION = `d.deleted_at is null
+  and exists (select 1 from division_members m where m.division_id = d.id and m.user_id = ?1)`
+const VISIBLE_PROJECT = `p.status != 'archived'
+  and exists (select 1 from divisions d where d.id = p.division_id and d.deleted_at is null)
+  and (p.creator_id = ?1 or exists (select 1 from project_members m where m.project_id = p.id and m.user_id = ?1))`
+
+/** Throws 403 unless the viewer can see the division or project; the private tab is only id 0. */
 async function assertMember(db: D1Database, kind: Kind, id: number, userId: number) {
-  if (kind === 'private') return
+  if (kind === 'private') {
+    if (id !== 0) throw new HTTPException(404, { message: 'The private tab is 0' })
+    return
+  }
   const sql =
     kind === 'division'
-      ? 'select 1 from division_members where division_id = ?1 and user_id = ?2'
-      : `select 1 from projects p where p.id = ?1 and (p.creator_id = ?2
-           or exists (select 1 from project_members m where m.project_id = p.id and m.user_id = ?2))`
-  if (!(await db.prepare(sql).bind(id, userId).first())) throw new HTTPException(403, { message: 'Not a member' })
+      ? `select 1 from divisions d where d.id = ?2 and ${VISIBLE_DIVISION}`
+      : `select 1 from projects p where p.id = ?2 and ${VISIBLE_PROJECT}`
+  if (!(await db.prepare(sql).bind(userId, id).first())) throw new HTTPException(403, { message: 'Not a member' })
 }
 
 export const tabs = new Hono<AppEnv>()
@@ -62,13 +76,9 @@ export const tabs = new Hono<AppEnv>()
 tabs.get('/', async (c) => {
   const me = c.get('user').id
   const { results } = await c.env.DB.prepare(
-    `select 'division' kind, d.id, d.name from divisions d
-       join division_members m on m.division_id = d.id and m.user_id = ?1
-       where d.deleted_at is null
+    `select 'division' kind, d.id, d.name from divisions d where ${VISIBLE_DIVISION}
      union all
-     select 'project', p.id, p.name from projects p
-       where p.status != 'archived' and (p.creator_id = ?1
-         or exists (select 1 from project_members m where m.project_id = p.id and m.user_id = ?1))
+     select 'project', p.id, p.name from projects p where ${VISIBLE_PROJECT}
      order by kind, id`,
   )
     .bind(me)
@@ -94,8 +104,8 @@ tabs.get('/:kind{private|division|project}/:id{[0-9]+}/members', async (c) => {
   const kind = c.req.param('kind') as Kind
   const id = Number(c.req.param('id'))
   const me = c.get('user').id
-  if (kind === 'private') return c.json([])
   await assertMember(c.env.DB, kind, id, me)
+  if (kind === 'private') return c.json([])
   const sql =
     kind === 'division'
       ? 'select u.id, u.name, m.role_type role from division_members m join users u on u.id = m.user_id where m.division_id = ?1 and u.is_active = 1'

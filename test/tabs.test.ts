@@ -69,6 +69,28 @@ it('returns 403 for a division or project the viewer is not in', async () => {
   }
 })
 
+it('returns 403 for an archived project or a deleted division, and hides the division’s projects', async () => {
+  await env.DB.prepare("update projects set status = 'archived' where id = 1").run()
+  for (const path of ['/tabs/project/1/tasks', '/tabs/project/1/members']) {
+    expect((await api(mira, path)).status, path).toBe(403)
+  }
+  await env.DB.prepare("update divisions set deleted_at = datetime('now') where id = 1").run()
+  expect((await json('/tabs')).map((t: any) => t.kind)).toEqual(['private'])
+  for (const path of ['/tabs/division/1/tasks', '/tabs/division/1/members', '/tabs/project/2/tasks']) {
+    expect((await api(mira, path)).status, path).toBe(403)
+  }
+})
+
+it('the private tab is only id 0', async () => {
+  expect((await api(mira, '/tabs/private/5/tasks')).status).toBe(404)
+  expect((await api(mira, '/tabs/private/5/members')).status).toBe(404)
+})
+
+it('sends a date-only due date as midnight UTC', async () => {
+  await env.DB.prepare("update personal_tasks set due_date = '2026-10-12' where id = 1").run()
+  expect((await json('/tabs/private/0/tasks'))[0].dueDate).toBe('2026-10-12T00:00:00Z')
+})
+
 it('needs a token', async () => {
   expect((await api('nope', '/tabs')).status).toBe(401)
 })
