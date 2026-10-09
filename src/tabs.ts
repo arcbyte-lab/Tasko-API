@@ -56,7 +56,7 @@ const VISIBLE_DIVISION = `d.deleted_at is null
   and exists (select 1 from division_members m where m.division_id = d.id and m.user_id = ?1)`
 const VISIBLE_PROJECT = `p.status != 'archived'
   and exists (select 1 from divisions d where d.id = p.division_id and d.deleted_at is null)
-  and (p.creator_id = ?1 or exists (select 1 from project_members m where m.project_id = p.id and m.user_id = ?1))`
+  and exists (select 1 from project_members m where m.project_id = p.id and m.user_id = ?1)` // membership is the member tables alone (0002)
 
 /** Throws 403 unless the viewer can see the division or project; the private tab is only id 0. */
 async function assertMember(db: D1Database, kind: Kind, id: number, userId: number) {

@@ -18,10 +18,12 @@ it('lists private, then divisions, then projects', async () => {
   ])
 })
 
-it('includes a project the viewer created without a member row, and leaves out archived ones', async () => {
-  await env.DB.prepare('delete from project_members where project_id = 2 and user_id = 1').run()
+it('leaves out archived projects, and one the viewer created but is no longer a member of (0002)', async () => {
   await env.DB.prepare("update projects set status = 'archived' where id = 1").run()
   expect((await json('/tabs')).map((t: any) => t.name)).toEqual(['private', 'tech', 'tasko-web'])
+  await env.DB.prepare('delete from project_members where project_id = 2 and user_id = 1').run()
+  expect((await json('/tabs')).map((t: any) => t.name)).toEqual(['private', 'tech'])
+  expect((await api(mira, '/tabs/project/2/tasks')).status).toBe(403)
 })
 
 it('private holds only the viewer’s top-level personal tasks, mapped to the Task shape', async () => {
