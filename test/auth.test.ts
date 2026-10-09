@@ -31,6 +31,21 @@ describe('login', () => {
     expect(await wrong.text()).toBe(await unknown.text())
   })
 
+  it('matches the email in any case', async () => {
+    expect((await post('/auth/login', { email: 'Mira@Arcbyte.dev', password: 'password' })).status).toBe(200)
+  })
+
+  it('answers a null body with 400', async () => {
+    expect((await post('/auth/login', null)).status).toBe(400)
+  })
+
+  it('answers a malformed stored hash with 401, not 500', async () => {
+    for (const bad of ['pbkdf2_sha256$100000$AAAA$AAAA', 'pbkdf2_sha256$999999$AAAA$AAAA', 'pbkdf2_sha256$100000']) {
+      await env.DB.prepare('update users set password = ? where id = 1').bind(bad).run()
+      expect((await post('/auth/login', { email: 'mira@arcbyte.dev', password: 'password' })).status).toBe(401)
+    }
+  })
+
   it('rejects an inactive user', async () => {
     await env.DB.prepare('update users set is_active = 0 where id = 1').run()
     expect((await post('/auth/login', { email: 'mira@arcbyte.dev', password: 'password' })).status).toBe(401)

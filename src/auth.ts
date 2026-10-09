@@ -21,11 +21,16 @@ export async function hashPassword(password: string) {
   return `pbkdf2_sha256$${ITERATIONS}$${b64(salt)}$${b64(await pbkdf2(password, salt, ITERATIONS))}`
 }
 
+/** False, not a throw, for a malformed stored hash, so a bad row is a 401 and not a 500. */
 async function verifyPassword(password: string, stored: string) {
   const [scheme, iterations, salt, hash] = stored.split('$')
   if (scheme !== 'pbkdf2_sha256') return false
-  const actual = await pbkdf2(password, unb64(salt), Number(iterations))
-  return crypto.subtle.timingSafeEqual(actual, unb64(hash))
+  try {
+    const actual = await pbkdf2(password, unb64(salt), Number(iterations))
+    return crypto.subtle.timingSafeEqual(actual, unb64(hash))
+  } catch {
+    return false
+  }
 }
 
 // Checked when the email is unknown, so that answer takes as long as a wrong password.
@@ -37,11 +42,12 @@ const sha256 = async (token: string) => hex(await crypto.subtle.digest('SHA-256'
 export const auth = new Hono<AppEnv>()
 
 auth.post('/login', async (c) => {
-  const { email, password } = await c.req.json<{ email?: unknown; password?: unknown }>().catch(() => ({}) as never)
+  const body = await c.req.json<{ email?: unknown; password?: unknown } | null>().catch(() => null)
+  const { email, password } = body ?? {}
   if (typeof email !== 'string' || typeof password !== 'string') {
     throw new HTTPException(400, { message: 'email and password are required' })
   }
-  const row = await c.env.DB.prepare('select id, name, email, password, is_active from users where email = ?')
+  const row = await c.env.DB.prepare('select id, name, email, password, is_active from users where email = ? collate nocase')
     .bind(email)
     .first<User & { password: string; is_active: number }>()
   const ok = await verifyPassword(password, row?.password ?? DUMMY_HASH)
