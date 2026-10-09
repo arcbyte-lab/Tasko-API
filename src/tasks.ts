@@ -191,9 +191,16 @@ tasks.post('/tabs/:kind{private|division|project}/:id{[0-9]+}/tasks', async (c) 
   return c.json(toTask(row!), 201)
 })
 
+/** The assignee, the creator and the reviewers edit a team task; only the creator and reviewers reassign it. */
 tasks.patch('/tasks/:id{[0-9]+}', async (c) => {
+  const me = c.get('user').id
   const task = await teamTask(c)
+  const lead = task.creator_id === me || (await isReviewer(c.env.DB, task, me))
+  if (!lead && task.assignee_id !== me) throw new HTTPException(403, { message: 'Only the assignee, the creator or a reviewer can edit this task' })
   const f = await readFields(c, [])
+  if (!lead && 'assigneeId' in f && f.assigneeId !== task.assignee_id) {
+    throw new HTTPException(403, { message: 'Only the creator or a reviewer can reassign this task' })
+  }
   const tab = tabOf(task)
   await assertAssignable(c.env.DB, tab.kind, tab.id, f.assigneeId)
   const set = setClause(f, false)
@@ -290,14 +297,15 @@ tasks.patch('/personal-tasks/:id{[0-9]+}/status', async (c) => {
 /**
  * Who reviews a task (arcbyte decision 0004): in a project, its
  * person-in-charge or its author; in a division only, its admin or supervisor.
- * A reviewer may review their own task.
+ * The author counts only while still a member (decision 0002). A reviewer may
+ * review their own task.
  */
 export async function isReviewer(db: D1Database, task: TeamTask, userId: number) {
   const tab = tabOf(task)
   const sql =
     tab.kind === 'project'
-      ? `select 1 from projects p where p.id = ?1 and (p.creator_id = ?2 or exists (select 1 from project_members m
-           where m.project_id = p.id and m.user_id = ?2 and m.role = 'person-in-charge'))`
+      ? `select 1 from project_members m join projects p on p.id = m.project_id
+         where m.project_id = ?1 and m.user_id = ?2 and (m.role = 'person-in-charge' or p.creator_id = ?2)`
       : `select 1 from division_members where division_id = ?1 and user_id = ?2 and role_type in ('admin', 'supervisor')`
   return !!(await db.prepare(sql).bind(tab.id, userId).first())
 }

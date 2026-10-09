@@ -81,7 +81,8 @@ describe('create', () => {
 
 describe('update', () => {
   it('changes only the fields sent', async () => {
-    const task = await json(send('PATCH', '/tasks/2', { name: 'Port the tokens', priority: 1, dueDate: null, assigneeId: 3 }))
+    const ana = await login('ana@arcbyte.dev') // task 2's creator
+    const task = await json(send('PATCH', '/tasks/2', { name: 'Port the tokens', priority: 1, dueDate: null, assigneeId: 3 }, ana))
     expect(task).toMatchObject({ id: 2, name: 'Port the tokens', priority: 1, dueDate: null, assigneeId: 3, status: 'waiting', code: 'TA-0012' })
   })
 
@@ -94,8 +95,19 @@ describe('update', () => {
   it('does not touch status, and checks the assignee and the viewer', async () => {
     await send('PATCH', '/tasks/2', { status: 'done' })
     expect((await env.DB.prepare('select status from tasks where id = 2').first())!.status).toBe('waiting')
-    expect((await send('PATCH', '/tasks/2', { assigneeId: 99 })).status).toBe(422)
+    expect((await send('PATCH', '/tasks/2', { assigneeId: 99 }, await login('ana@arcbyte.dev'))).status).toBe(422)
     expect((await send('PATCH', '/personal-tasks/2', { name: 'x' }, await login('ana@arcbyte.dev'))).status).toBe(404)
+  })
+
+  it('the assignee edits but can’t reassign; other members can’t edit; the creator and reviewers can do both', async () => {
+    // Task 2 on tasko-app: assigned to Mira, created by Ana (also its person-in-charge); Budi is a plain member.
+    expect((await send('PATCH', '/tasks/2', { name: 'Port tokens' })).status, 'assignee edits').toBe(200)
+    expect((await send('PATCH', '/tasks/2', { assigneeId: 1, priority: 3 })).status, 'same assignee is not a reassign').toBe(200)
+    expect((await send('PATCH', '/tasks/2', { assigneeId: 3 })).status, 'assignee reassigns').toBe(403)
+    const budi = await login('budi@arcbyte.dev')
+    expect((await send('PATCH', '/tasks/2', { name: 'mine now' }, budi)).status, 'member edits').toBe(403)
+    expect((await send('PATCH', '/tasks/2', { assigneeId: 3 }, budi)).status, 'member takes it').toBe(403)
+    expect((await send('PATCH', '/tasks/2', { assigneeId: 3 }, await login('ana@arcbyte.dev'))).status, 'creator reassigns').toBe(200)
   })
 })
 
