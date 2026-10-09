@@ -2,7 +2,7 @@ import { cloudflareTest, readD1Migrations } from '@cloudflare/vitest-plugin'
 import { defineConfig } from 'vitest/config'
 
 export default defineConfig(async () => {
-  const [seed] = await readD1Migrations('seed')
+  const seed = (await readD1Migrations('seed')).find((m) => m.name === 'seed.sql')!
   return {
     plugins: [
       cloudflareTest({
