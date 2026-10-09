@@ -15,7 +15,6 @@ function teamMove(from: string, to: string, needsReview: boolean): string | null
   if (open && to === 'done' && !needsReview) return "completed_date = datetime('now')"
   if (open && to === 'review' && needsReview) return "review_date = datetime('now')"
   if (from === 'done' && to === 'waiting') return 'completed_date = null, review_date = null'
-  if (from === 'waiting' && to === 'in_progress') return ''
   return null
 }
 

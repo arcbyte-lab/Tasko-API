@@ -57,34 +57,31 @@ describe('team tasks', () => {
     expect((await row('select review_date from tasks where id = 4')).review_date).toBeNull()
   })
 
-  it('waiting → in progress', async () => {
-    expect(((await (await tick('/tasks/2', 'inProgress')).json()) as any).status).toBe('inProgress')
-  })
-
   it('anything else is 422', async () => {
     expect((await tick('/tasks/5', 'done')).status, 'proof required').toBe(422)
     expect((await tick('/tasks/2', 'review')).status, 'no proof required').toBe(422)
     expect((await tick('/tasks/12', 'done')).status, 'out of review').toBe(422)
     expect((await tick('/tasks/12', 'inProgress')).status, 'out of review').toBe(422)
+    expect((await tick('/tasks/2', 'inProgress')).status, 'the checkbox never sets in progress (0004)').toBe(422)
     expect((await tick('/tasks/1', 'waiting')).status, 'in progress → waiting').toBe(422)
     expect((await tick('/tasks/2', 'todo')).status, 'personal-only status').toBe(422)
   })
 
   it('only the assignee can tick an assigned task', async () => {
     expect((await tick('/tasks/7', 'done')).status).toBe(403)
-    expect((await tick('/tasks/2', 'inProgress', await login('ana@arcbyte.dev'))).status).toBe(403)
+    expect((await tick('/tasks/2', 'done', await login('ana@arcbyte.dev'))).status).toBe(403)
   })
 
   it('anyone in the tab can tick an unassigned task, and no one else', async () => {
     await env.DB.prepare('update tasks set assignee_id = null where id in (2, 3)').run()
-    expect((await tick('/tasks/2', 'inProgress', await login('ana@arcbyte.dev'))).status).toBe(200)
+    expect((await tick('/tasks/2', 'done', await login('ana@arcbyte.dev'))).status).toBe(200)
     await env.DB.prepare('delete from project_members where project_id = 1 and user_id = 1').run()
-    expect((await tick('/tasks/3', 'inProgress')).status).toBe(403)
+    expect((await tick('/tasks/3', 'done')).status).toBe(403)
   })
 
   it('not even the assignee, once removed from the tab or once it is archived', async () => {
     await env.DB.prepare('delete from project_members where project_id = 1 and user_id = 1').run()
-    expect((await tick('/tasks/2', 'inProgress')).status, 'removed').toBe(403)
+    expect((await tick('/tasks/2', 'done')).status, 'removed').toBe(403)
     await env.DB.prepare("update projects set status = 'archived' where id = 2").run()
     expect((await tick('/tasks/5', 'review')).status, 'archived').toBe(403)
   })
