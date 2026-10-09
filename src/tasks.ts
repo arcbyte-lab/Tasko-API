@@ -1,6 +1,7 @@
 import { Hono, type Context } from 'hono'
 import { HTTPException } from 'hono/http-exception'
 import type { AppEnv } from './auth'
+import { notify } from './notifications'
 import { assertMember, iso, PERSONAL_TASK_COLUMNS, STATUS, TEAM_TASK_COLUMNS, toTask, type TaskRow } from './tabs'
 
 /** The app sends the Dart enum name; the database holds the snake_case value. */
@@ -192,8 +193,9 @@ tasks.post('/tabs/:kind{private|division|project}/:id{[0-9]+}/tasks', async (c) 
   const division_id =
     kind === 'division' ? id : (await c.env.DB.prepare('select division_id from projects where id = ?').bind(id).first<number>('division_id'))!
   const project_id = kind === 'project' ? id : null
-  const row = await insertTeamTask(c.env.DB, { division_id, project_id, parent_id: null, creator_id: me, assignee_id: f.assigneeId ?? null }, f)
-  return c.json(toTask(row!), 201)
+  const row = (await insertTeamTask(c.env.DB, { division_id, project_id, parent_id: null, creator_id: me, assignee_id: f.assigneeId ?? null }, f))!
+  if (row.assignee_id !== null) await notify(c.env.DB, [row.assignee_id], 'task_assigned', { taskId: row.id, taskName: row.name, actorId: me })
+  return c.json(toTask(row), 201)
 })
 
 /** The assignee, the creator and the reviewers edit a team task; only the creator and reviewers reassign it. */
@@ -209,10 +211,18 @@ tasks.patch('/tasks/:id{[0-9]+}', async (c) => {
   const tab = tabOf(task)
   await assertAssignable(c.env.DB, tab.kind, tab.id, f.assigneeId)
   const set = setClause(f, false)
-  const row = await c.env.DB.prepare(`update tasks set ${set.sql} where id = ? returning ${TEAM_TASK_COLUMNS}`)
-    .bind(...set.values, c.req.param('id'))
+  // A reassignment only applies over the assignee read above, so two at once can't both notify.
+  const reassign = 'assigneeId' in f
+  const row = await c.env.DB.prepare(
+    `update tasks set ${set.sql} where id = ?${reassign ? ' and assignee_id is ?' : ''} returning ${TEAM_TASK_COLUMNS}`,
+  )
+    .bind(...set.values, c.req.param('id'), ...(reassign ? [task.assignee_id] : []))
     .first<TaskRow>()
-  return c.json(toTask(row!))
+  if (!row) throw changedMeanwhile()
+  if (row.assignee_id !== null && row.assignee_id !== task.assignee_id) {
+    await notify(c.env.DB, [row.assignee_id], 'task_assigned', { taskId: row.id, taskName: row.name, actorId: c.get('user').id })
+  }
+  return c.json(toTask(row))
 })
 
 tasks.patch('/personal-tasks/:id{[0-9]+}', async (c) => {
@@ -252,6 +262,8 @@ tasks.post('/tasks/:id{[0-9]+}/subtasks', async (c) => {
     },
     { name },
   )
+  const me = c.get('user').id
+  if (row!.assignee_id !== null) await notify(c.env.DB, [row!.assignee_id], 'task_assigned', { taskId: row!.id, taskName: row!.name, actorId: me })
   return c.json(toTask(row!), 201)
 })
 
@@ -280,6 +292,9 @@ tasks.patch('/tasks/:id{[0-9]+}/status', async (c) => {
     .bind(to, c.req.param('id'), task.status)
     .first<TaskRow>()
   if (!row) throw await goneOrChanged(c.env.DB, 'tasks', c.req.param('id'))
+  if (to === 'review') {
+    await notify(c.env.DB, await reviewersOf(c.env.DB, task), 'task_review_requested', { taskId: row.id, taskName: row.name, actorId: me })
+  }
   return c.json(toTask(row))
 })
 
@@ -305,15 +320,19 @@ tasks.patch('/personal-tasks/:id{[0-9]+}/status', async (c) => {
  * The author counts only while still a member (decision 0002). A reviewer may
  * review their own task.
  */
-export async function isReviewer(db: D1Database, task: TeamTask, userId: number) {
+/** The task's reviewers, or with [only], just that user if they are one. */
+async function reviewersOf(db: D1Database, task: TeamTask, only: number | null = null) {
   const tab = tabOf(task)
   const sql =
     tab.kind === 'project'
-      ? `select 1 from project_members m join projects p on p.id = m.project_id
-         where m.project_id = ?1 and m.user_id = ?2 and (m.role = 'person-in-charge' or p.creator_id = ?2)`
-      : `select 1 from division_members where division_id = ?1 and user_id = ?2 and role_type in ('admin', 'supervisor')`
-  return !!(await db.prepare(sql).bind(tab.id, userId).first())
+      ? `select m.user_id id from project_members m join projects p on p.id = m.project_id
+         where m.project_id = ?1 and (m.role = 'person-in-charge' or m.user_id = p.creator_id)`
+      : `select user_id id from division_members where division_id = ?1 and role_type in ('admin', 'supervisor')`
+  const { results } = await db.prepare(`select id from (${sql}) where ?2 is null or id = ?2`).bind(tab.id, only).all<{ id: number }>()
+  return results.map((r) => r.id)
 }
+
+const isReviewer = async (db: D1Database, task: TeamTask, userId: number) => (await reviewersOf(db, task, userId)).length > 0
 
 tasks.get('/tasks/:id{[0-9]+}/detail', async (c) => {
   const me = c.get('user').id
@@ -395,8 +414,12 @@ tasks.post('/tasks/:id{[0-9]+}/reviews', async (c) => {
        select ?, ?, ?, ?, datetime('now'), datetime('now') where changes() = 1`,
     ).bind(id, me, approve ? 'approved' : 'rejected', reason?.trim() || null),
   ])
-  if (!updated.results.length) throw new HTTPException(409, { message: 'This task is not waiting for review' })
-  return c.json(toTask(updated.results[0]))
+  const row = updated.results[0]
+  if (!row) throw new HTTPException(409, { message: 'This task is not waiting for review' })
+  if (row.assignee_id !== null) {
+    await notify(c.env.DB, [row.assignee_id], 'task_reviewed', { taskId: row.id, taskName: row.name, actorId: me, approved: approve })
+  }
+  return c.json(toTask(row))
 })
 
 tasks.post('/tasks/:id{[0-9]+}/deadline-requests', async (c) => {
