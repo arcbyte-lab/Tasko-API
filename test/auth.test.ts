@@ -16,9 +16,11 @@ describe('login', () => {
     const res = await post('/auth/login', { email: 'mira@arcbyte.dev', password: 'password' })
     expect(res.status).toBe(200)
     const body = (await res.json()) as { token: string; user: unknown }
-    expect(body.user).toEqual({ id: 1, name: 'Mira', email: 'mira@arcbyte.dev' })
-    const row = await env.DB.prepare('select tokenable_type, tokenable_id, token from personal_access_tokens').first()
-    expect(row).toMatchObject({ tokenable_type: 'user', tokenable_id: 1 })
+    expect(body.user).toEqual({ id: 1, name: 'Mira', email: 'mira@arcbyte.dev', mustChangePassword: false })
+    const row = await env.DB.prepare(
+      "select tokenable_type, tokenable_id, token, round(julianday(expires_at) - julianday('now')) days from personal_access_tokens",
+    ).first()
+    expect(row).toMatchObject({ tokenable_type: 'user', tokenable_id: 1, days: 30 })
     expect(row!.token).not.toBe(body.token)
     expect(row!.token).toMatch(/^[0-9a-f]{64}$/)
   })
@@ -50,14 +52,41 @@ describe('login', () => {
     await env.DB.prepare('update users set is_active = 0 where id = 1').run()
     expect((await post('/auth/login', { email: 'mira@arcbyte.dev', password: 'password' })).status).toBe(401)
   })
+
+  it('reports must_change_password at login and on /me', async () => {
+    await env.DB.prepare('update users set must_change_password = 1 where id = 1').run()
+    const res = await post('/auth/login', { email: 'mira@arcbyte.dev', password: 'password' })
+    const body = (await res.json()) as { token: string; user: { mustChangePassword: boolean } }
+    expect(body.user.mustChangePassword).toBe(true)
+    expect(((await (await me(body.token)).json()) as any).mustChangePassword).toBe(true)
+  })
+})
+
+it('GET / is a public health check', async () => {
+  const res = await app.request('/', {}, env)
+  expect(res.status).toBe(200)
+  expect(await res.json()).toEqual({ ok: true })
 })
 
 describe('GET /me', () => {
   it('returns the viewer and marks the token used', async () => {
     const res = await me(await login())
     expect(res.status).toBe(200)
-    expect(await res.json()).toEqual({ id: 1, name: 'Mira', email: 'mira@arcbyte.dev' })
+    expect(await res.json()).toEqual({ id: 1, name: 'Mira', email: 'mira@arcbyte.dev', mustChangePassword: false })
     expect((await env.DB.prepare('select last_used_at from personal_access_tokens').first())!.last_used_at).not.toBeNull()
+  })
+
+  it('writes last_used_at at most once an hour', async () => {
+    const token = await login()
+    const usedAt = async () => (await env.DB.prepare('select last_used_at from personal_access_tokens').first())!.last_used_at
+    await env.DB.prepare("update personal_access_tokens set last_used_at = datetime('now', '-10 minutes')").run()
+    const recent = await usedAt()
+    await me(token)
+    expect(await usedAt(), 'within the hour').toBe(recent)
+    await env.DB.prepare("update personal_access_tokens set last_used_at = datetime('now', '-2 hours')").run()
+    const old = await usedAt()
+    await me(token)
+    expect(await usedAt(), 'after an hour').not.toBe(old)
   })
 
   it('rejects a missing or unknown token', async () => {

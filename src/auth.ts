@@ -2,7 +2,10 @@ import { Hono } from 'hono'
 import { bearerAuth } from 'hono/bearer-auth'
 import { HTTPException } from 'hono/http-exception'
 
-export type User = { id: number; name: string; email: string }
+export type User = { id: number; name: string; email: string; mustChangePassword: boolean }
+
+/** How long a login lasts. */
+const TOKEN_DAYS = 30
 export type AppEnv = { Bindings: CloudflareBindings; Variables: { user: User; tokenId: number } }
 
 const ITERATIONS = 100_000 // the most PBKDF2 iterations Workers allows
@@ -47,34 +50,44 @@ auth.post('/login', async (c) => {
   if (typeof email !== 'string' || typeof password !== 'string') {
     throw new HTTPException(400, { message: 'email and password are required' })
   }
-  const row = await c.env.DB.prepare('select id, name, email, password, is_active from users where email = ? collate nocase')
+  const row = await c.env.DB.prepare(
+    'select id, name, email, password, is_active, must_change_password from users where email = ? collate nocase',
+  )
     .bind(email)
-    .first<User & { password: string; is_active: number }>()
+    .first<{ id: number; name: string; email: string; password: string; is_active: number; must_change_password: number }>()
   const ok = await verifyPassword(password, row?.password ?? DUMMY_HASH)
   if (!row || !ok || !row.is_active) throw new HTTPException(401, { message: 'Invalid email or password' })
 
   const token = hex(crypto.getRandomValues(new Uint8Array(32)))
   await c.env.DB.prepare(
-    "insert into personal_access_tokens (tokenable_type, tokenable_id, name, token, created_at, updated_at) values ('user', ?, 'app', ?, datetime('now'), datetime('now'))",
+    `insert into personal_access_tokens (tokenable_type, tokenable_id, name, token, expires_at, created_at, updated_at)
+     values ('user', ?, 'app', ?, datetime('now', '+${TOKEN_DAYS} days'), datetime('now'), datetime('now'))`,
   )
     .bind(row.id, await sha256(token))
     .run()
-  return c.json({ token, user: { id: row.id, name: row.name, email: row.email } })
+  // ponytail: reported, not enforced; block other routes once a change-password route exists.
+  const user: User = { id: row.id, name: row.name, email: row.email, mustChangePassword: row.must_change_password === 1 }
+  return c.json({ token, user })
 })
 
 /** Every route but login: a live token for an active user. */
 export const requireUser = bearerAuth<AppEnv>({
   verifyToken: async (token, c) => {
     const row = await c.env.DB.prepare(
-      `select t.id token_id, u.id, u.name, u.email from personal_access_tokens t
+      `select t.id token_id, u.id, u.name, u.email, u.must_change_password from personal_access_tokens t
        join users u on u.id = t.tokenable_id and t.tokenable_type = 'user'
        where t.token = ? and u.is_active = 1 and (t.expires_at is null or t.expires_at > datetime('now'))`,
     )
       .bind(await sha256(token))
-      .first<User & { token_id: number }>()
+      .first<{ token_id: number; id: number; name: string; email: string; must_change_password: number }>()
     if (!row) return false
-    await c.env.DB.prepare("update personal_access_tokens set last_used_at = datetime('now') where id = ?").bind(row.token_id).run()
-    c.set('user', { id: row.id, name: row.name, email: row.email })
+    // At most one write an hour per token, not one per request.
+    await c.env.DB.prepare(
+      "update personal_access_tokens set last_used_at = datetime('now') where id = ? and (last_used_at is null or last_used_at < datetime('now', '-1 hour'))",
+    )
+      .bind(row.token_id)
+      .run()
+    c.set('user', { id: row.id, name: row.name, email: row.email, mustChangePassword: row.must_change_password === 1 })
     c.set('tokenId', row.token_id)
     return true
   },
