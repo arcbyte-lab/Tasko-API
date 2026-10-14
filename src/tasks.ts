@@ -30,10 +30,10 @@ function personalMove(from: string, to: string): string | null {
   return null
 }
 
-const bad = (message: string) => new HTTPException(400, { message })
+export const bad = (message: string) => new HTTPException(400, { message })
 
 /** The JSON body as an object; null, an array, a bare value or bad JSON is a 400. */
-async function readBody(c: Context<AppEnv>): Promise<Record<string, unknown>> {
+export async function readBody(c: Context<AppEnv>): Promise<Record<string, unknown>> {
   const body: unknown = await c.req.json().catch(() => undefined)
   if (typeof body !== 'object' || body === null || Array.isArray(body)) throw bad('The body must be a JSON object')
   return body as Record<string, unknown>
@@ -76,7 +76,7 @@ function dbDate(value: unknown, field: string) {
 type Fields = { name?: string; description?: string | null; priority?: number; dueDate?: string | null; assigneeId?: number | null; repeat?: string | null }
 
 /** A strict ISO 8601 date or date-time, or null; `new Date` alone takes 'March 5' and rolls Feb 30 into March. */
-function parseDue(s: unknown) {
+export function parseDue(s: unknown) {
   const m = typeof s === 'string' && /^(\d{4})-(\d\d)-(\d\d)(T\d\d:\d\d(:\d\d(\.\d+)?)?(Z|[+-]\d\d:\d\d)?)?$/.exec(s)
   if (!m) return null
   const day = new Date(Date.UTC(+m[1], +m[2] - 1, +m[3]))
