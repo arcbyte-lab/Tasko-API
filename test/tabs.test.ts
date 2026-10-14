@@ -9,13 +9,14 @@ beforeEach(async () => {
 
 const json = async (path: string, token = mira) => (await api(token, path)).json() as Promise<any>
 
-it('lists private, then divisions, then projects', async () => {
+it('lists private, then divisions, then projects, each with the viewer’s role', async () => {
   expect(await json('/tabs')).toEqual([
-    { kind: 'private', id: 0, name: 'private' },
-    { kind: 'division', id: 1, name: 'tech' },
-    { kind: 'project', id: 1, name: 'tasko-app' },
-    { kind: 'project', id: 2, name: 'tasko-web' },
+    { kind: 'private', id: 0, name: 'private', role: null },
+    { kind: 'division', id: 1, name: 'tech', role: 'member' },
+    { kind: 'project', id: 1, name: 'tasko-app', role: 'member' },
+    { kind: 'project', id: 2, name: 'tasko-web', role: 'owner' },
   ])
+  expect((await json('/tabs', await login('ana@arcbyte.dev'))).map((t: any) => t.role)).toEqual([null, 'admin', 'person-in-charge', 'person-in-charge'])
 })
 
 it('leaves out archived projects, and one the viewer created but is no longer a member of (0002)', async () => {

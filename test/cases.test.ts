@@ -24,7 +24,7 @@ it('the special logins', async () => {
   expect(((await res.json()) as any).user.mustChangePassword).toBe(true)
   const hadi = await api('', '/auth/login', { method: 'POST', body: JSON.stringify({ email: 'hadi@arcbyte.dev', password: 'password' }) })
   expect(hadi.status).toBe(401)
-  expect(await json('/tabs', await login('indah@arcbyte.dev'))).toEqual([{ kind: 'private', id: 0, name: 'private' }])
+  expect(await json('/tabs', await login('indah@arcbyte.dev'))).toEqual([{ kind: 'private', id: 0, name: 'private', role: null }])
   expect((await json('/tabs/project/3/members')).map((m: any) => m.user.name)).not.toContain('Hadi')
 })
 
