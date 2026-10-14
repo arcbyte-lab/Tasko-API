@@ -2,6 +2,7 @@ import { Hono, type Context } from 'hono'
 import { HTTPException } from 'hono/http-exception'
 import type { AppEnv } from './auth'
 import { notify } from './notifications'
+import { nextDue, readRepeat, type Repeat } from './repeat'
 import { assertMember, iso, PERSONAL_TASK_COLUMNS, STATUS, TEAM_TASK_COLUMNS, toTask, type TaskRow } from './tabs'
 
 /** The app sends the Dart enum name; the database holds the snake_case value. */
@@ -72,7 +73,7 @@ function dbDate(value: unknown, field: string) {
   return date.toISOString().slice(0, 19).replace('T', ' ')
 }
 
-type Fields = { name?: string; description?: string | null; priority?: number; dueDate?: string | null; assigneeId?: number | null }
+type Fields = { name?: string; description?: string | null; priority?: number; dueDate?: string | null; assigneeId?: number | null; repeat?: string | null }
 
 /** A strict ISO 8601 date or date-time, or null; `new Date` alone takes 'March 5' and rolls Feb 30 into March. */
 function parseDue(s: unknown) {
@@ -107,6 +108,7 @@ async function readFields(c: Context<AppEnv>, required: (keyof Fields)[]): Promi
     if (body.assigneeId !== null && !Number.isInteger(body.assigneeId)) throw bad('assigneeId must be a user id or null')
     f.assigneeId = body.assigneeId as number | null
   }
+  if ('repeat' in body) f.repeat = readRepeat(body.repeat)
   return f
 }
 
@@ -131,10 +133,19 @@ const tabOf = (t: TeamTask) =>
 /** A team task in one of the viewer's tabs: 404 if missing, 403 if outside them. */
 async function teamTask(c: Context<AppEnv>) {
   const task = await c.env.DB.prepare(
-    'select division_id, project_id, assignee_id, creator_id, status, required_proof_type, due_date from tasks where id = ?',
+    'select division_id, project_id, parent_id, assignee_id, creator_id, status, required_proof_type, due_date, repeat from tasks where id = ?',
   )
     .bind(c.req.param('id'))
-    .first<TeamTask & { creator_id: number; status: string; required_proof_type: string | null; due_date: string | null }>()
+    .first<
+      TeamTask & {
+        parent_id: number | null
+        creator_id: number
+        status: string
+        required_proof_type: string | null
+        due_date: string | null
+        repeat: string | null
+      }
+    >()
   if (!task) throw new HTTPException(404, { message: 'No such task' })
   const tab = tabOf(task)
   await assertMember(c.env.DB, tab.kind, tab.id, c.get('user').id)
@@ -154,18 +165,26 @@ async function ownPersonalTask(c: Context<AppEnv>) {
  * `code` is the division's prefix and the next number in that division, worked
  * out inside the insert so two inserts can never take the same one.
  */
-function insertTeamTask(db: D1Database, t: TeamTask & { parent_id: number | null; creator_id: number }, f: Fields) {
+function insertTeamTask(
+  db: D1Database,
+  t: TeamTask & { parent_id: number | null; creator_id: number; required_proof_type?: string | null },
+  f: Fields,
+  where = '',
+) {
   return db
     .prepare(
-      `insert into tasks (code, division_id, project_id, parent_id, creator_id, assignee_id, name, description, priority_level, due_date, created_at, updated_at)
+      `insert into tasks (code, division_id, project_id, parent_id, creator_id, assignee_id, name, description, priority_level, due_date,
+         required_proof_type, repeat, created_at, updated_at)
        select d.prefix || '-' || printf('%04d', 1 + coalesce(
            (select max(cast(substr(x.code, length(d.prefix) + 2) as integer)) from tasks x where substr(x.code, 1, length(d.prefix) + 1) = d.prefix || '-'), 0)),
-         d.id, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, datetime('now'), datetime('now')
-       from divisions d where d.id = ?1
+         d.id, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, datetime('now'), datetime('now')
+       from divisions d where d.id = ?1${where}
        returning ${TEAM_TASK_COLUMNS}`,
     )
-    .bind(t.division_id, t.project_id, t.parent_id, t.creator_id, t.assignee_id, f.name, f.description ?? null, f.priority ?? 2, f.dueDate ?? null)
-    .first<TaskRow>()
+    .bind(
+      t.division_id, t.project_id, t.parent_id, t.creator_id, t.assignee_id, f.name, f.description ?? null, f.priority ?? 2, f.dueDate ?? null,
+      t.required_proof_type ?? null, f.repeat ?? null,
+    )
 }
 
 function insertPersonalTask(db: D1Database, userId: number, parentId: number | null, f: Fields) {
@@ -186,6 +205,7 @@ function setClause(f: Fields, personal: boolean) {
     priority: 'priority_level',
     dueDate: 'due_date',
     assigneeId: 'assignee_id',
+    repeat: 'repeat',
   }
   const keys = Object.keys(f) as (keyof Fields)[]
   return { sql: [...keys.map((k) => `${column[k]} = ?`), "updated_at = datetime('now')"].join(', '), values: keys.map((k) => f[k]) }
@@ -197,6 +217,54 @@ async function goneOrChanged(db: D1Database, table: 'tasks' | 'personal_tasks', 
   return gone ? new HTTPException(404, { message: 'No such task' }) : changedMeanwhile()
 }
 
+/** Only a workspace's own top-level tasks repeat (arcbyte decision 0009), and only from a due date. */
+function assertCanRepeat(kind: 'private' | 'division' | 'project', parentId: number | null, due: string | null | undefined) {
+  if (kind !== 'division' || parentId !== null) throw new HTTPException(422, { message: 'Only a workspace task can repeat' })
+  if (due == null) throw new HTTPException(422, { message: 'A repeating task needs a due date' })
+}
+
+type Finished = TeamTask & {
+  name: string
+  description: string | null
+  priority_level: number
+  due_date: string | null
+  required_proof_type: string | null
+  repeat: string | null
+}
+
+/**
+ * Finishing a repeating task creates the next one, due one step later, and the
+ * rule moves onto it (Santian's repeat, decision 0009). One step only, even if
+ * finished late: no catch-up. Moving the rule is the guard, so unticking and
+ * ticking again never makes a second one. Sub-tasks, comments and proofs stay
+ * with the finished task. Returns whether a next one was created.
+ */
+async function createNextOccurrence(db: D1Database, id: number, me: number) {
+  const done = await db
+    .prepare('select division_id, project_id, assignee_id, name, description, priority_level, due_date, required_proof_type, repeat from tasks where id = ?')
+    .bind(id)
+    .first<Finished>()
+  if (!done?.repeat || !done.due_date) return false
+  const rule = JSON.parse(done.repeat) as Repeat
+  const due = nextDue(done.due_date, rule)
+  if (!due) return false
+  const keep = done.assignee_id !== null && (await isAssignable(db, 'division', done.division_id, done.assignee_id))
+  const next = { ...rule, count: rule.count === null ? null : rule.count - 1 }
+  // One transaction: the new task is written only if this call moved the rule off the finished one.
+  const [, inserted] = await db.batch<TaskRow>([
+    db.prepare('update tasks set repeat = null where id = ? and repeat = ?').bind(id, done.repeat),
+    insertTeamTask(
+      db,
+      { ...done, parent_id: null, creator_id: me, assignee_id: keep ? done.assignee_id : null },
+      { name: done.name, description: done.description, priority: done.priority_level, dueDate: due, repeat: JSON.stringify(next) },
+      ' and changes() = 1',
+    ),
+  ])
+  const row = inserted.results[0]
+  if (row?.assignee_id != null) await notify(db, [row.assignee_id], 'task_assigned', { taskId: row.id, taskName: row.name, actorId: me })
+  return !!row
+}
+
 export const tasks = new Hono<AppEnv>()
 
 tasks.post('/tabs/:kind{private|division|project}/:id{[0-9]+}/tasks', async (c) => {
@@ -205,6 +273,7 @@ tasks.post('/tabs/:kind{private|division|project}/:id{[0-9]+}/tasks', async (c) 
   const me = c.get('user').id
   await assertMember(c.env.DB, kind, id, me)
   const f = await readFields(c, ['name', 'priority'])
+  if (f.repeat != null) assertCanRepeat(kind, null, f.dueDate)
   if (kind === 'private') {
     if (f.assigneeId != null) throw noAssignee()
     return c.json(toTask((await insertPersonalTask(c.env.DB, me, null, f))!), 201)
@@ -213,7 +282,7 @@ tasks.post('/tabs/:kind{private|division|project}/:id{[0-9]+}/tasks', async (c) 
   const division_id =
     kind === 'division' ? id : (await c.env.DB.prepare('select division_id from projects where id = ?').bind(id).first<number>('division_id'))!
   const project_id = kind === 'project' ? id : null
-  const row = (await insertTeamTask(c.env.DB, { division_id, project_id, parent_id: null, creator_id: me, assignee_id: f.assigneeId ?? null }, f))!
+  const row = (await insertTeamTask(c.env.DB, { division_id, project_id, parent_id: null, creator_id: me, assignee_id: f.assigneeId ?? null }, f).first<TaskRow>())!
   if (row.assignee_id !== null) await notify(c.env.DB, [row.assignee_id], 'task_assigned', { taskId: row.id, taskName: row.name, actorId: me })
   return c.json(toTask(row), 201)
 })
@@ -230,6 +299,9 @@ tasks.patch('/tasks/:id{[0-9]+}', async (c) => {
   }
   const tab = tabOf(task)
   await assertAssignable(c.env.DB, tab.kind, tab.id, f.assigneeId)
+  if (('repeat' in f ? f.repeat : task.repeat) != null) {
+    assertCanRepeat(tab.kind, task.parent_id, 'dueDate' in f ? f.dueDate : task.due_date)
+  }
   const set = setClause(f, false)
   // A reassignment only applies over the assignee read above, so two at once can't both notify.
   const reassign = 'assigneeId' in f
@@ -249,7 +321,9 @@ tasks.patch('/personal-tasks/:id{[0-9]+}', async (c) => {
   await ownPersonalTask(c)
   const f = await readFields(c, [])
   if (f.assigneeId != null) throw noAssignee()
+  if (f.repeat != null) assertCanRepeat('private', null, f.dueDate)
   delete f.assigneeId
+  delete f.repeat
   const set = setClause(f, true)
   const row = await c.env.DB.prepare(`update personal_tasks set ${set.sql} where id = ? returning ${PERSONAL_TASK_COLUMNS}`)
     .bind(...set.values, c.req.param('id'))
@@ -281,7 +355,7 @@ tasks.post('/tasks/:id{[0-9]+}/subtasks', async (c) => {
       creator_id: c.get('user').id,
     },
     { name },
-  )
+  ).first<TaskRow>()
   const me = c.get('user').id
   if (row!.assignee_id !== null) await notify(c.env.DB, [row!.assignee_id], 'task_assigned', { taskId: row!.id, taskName: row!.name, actorId: me })
   return c.json(toTask(row!), 201)
@@ -327,6 +401,7 @@ tasks.patch('/tasks/:id{[0-9]+}/status', async (c) => {
   if (to === 'review') {
     await notify(c.env.DB, await reviewersOf(c.env.DB, task), 'task_review_requested', { taskId: row.id, taskName: row.name, actorId: me })
   }
+  if (to === 'done' && (await createNextOccurrence(c.env.DB, row.id, me))) row.repeat = null
   return c.json(toTask(row))
 })
 
@@ -460,6 +535,7 @@ tasks.post('/tasks/:id{[0-9]+}/reviews', async (c) => {
   if (row.assignee_id !== null) {
     await notify(c.env.DB, [row.assignee_id], 'task_reviewed', { taskId: row.id, taskName: row.name, actorId: me, approved: approve })
   }
+  if (approve && (await createNextOccurrence(c.env.DB, row.id, me))) row.repeat = null
   return c.json(toTask(row))
 })
 
