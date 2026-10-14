@@ -3,13 +3,14 @@ import { HTTPException } from 'hono/http-exception'
 import type { AppEnv } from './auth'
 import { iso } from './tabs'
 
-type Data = { taskId: number; taskName: string; actorId: number; approved?: boolean }
+type Data = { actorId: number; taskId?: number; taskName?: string; approved?: boolean; projectId?: number; projectName?: string }
 
 /** `notifications.type`, and the sentence the bell shows for it. */
 const TEXT = {
   task_assigned: (actor, d) => `${actor} assigned you ${d.taskName}`,
   task_review_requested: (actor, d) => `${actor} sent ${d.taskName} for review`,
   task_reviewed: (actor, d) => `${actor} ${d.approved ? 'approved' : 'rejected'} ${d.taskName}`,
+  project_member_added: (actor, d) => `${actor} added you to ${d.projectName}`,
 } satisfies Record<string, (actor: string, d: Data) => string>
 
 const textOf = (type: string, actor: string, data: Data) =>
