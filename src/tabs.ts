@@ -77,14 +77,19 @@ export const tabs = new Hono<AppEnv>()
 tabs.get('/', async (c) => {
   const me = c.get('user').id
   const { results } = await c.env.DB.prepare(
-    `select 'division' kind, d.id, d.name from divisions d where ${VISIBLE_DIVISION}
+    `select 'division' kind, d.id, d.name,
+       (select m.role_type from division_members m where m.division_id = d.id and m.user_id = ?1) role
+     from divisions d where ${VISIBLE_DIVISION}
      union all
-     select 'project', p.id, p.name from projects p where ${VISIBLE_PROJECT}
+     select 'project', p.id, p.name,
+       (select m.role from project_members m where m.project_id = p.id and m.user_id = ?1)
+     from projects p where ${VISIBLE_PROJECT}
      order by kind, id`,
   )
     .bind(me)
     .all()
-  return c.json([{ kind: 'private', id: 0, name: 'private' }, ...results])
+  // `role` is the viewer's, so the app knows which buttons to show; the server still checks every change.
+  return c.json([{ kind: 'private', id: 0, name: 'private', role: null }, ...results])
 })
 
 tabs.get('/:kind{private|division|project}/:id{[0-9]+}/tasks', async (c) => {
