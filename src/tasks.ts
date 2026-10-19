@@ -257,7 +257,11 @@ async function createNextOccurrence(db: D1Database, id: number, me: number) {
   if (!done?.repeat || !done.due_date) return false
   const rule = JSON.parse(done.repeat) as Repeat
   const due = nextDue(done.due_date, rule)
-  if (!due) return false
+  if (!due) {
+    // Ran out: the repeat ends, and stays listed until a lead deletes it (decision 0013).
+    await db.prepare('update tasks set repeat_ended = repeat, repeat = null where id = ? and repeat = ?').bind(id, done.repeat).run()
+    return false
+  }
   const keep = done.assignee_id !== null && (await isAssignable(db, 'division', done.division_id, done.assignee_id))
   const next = { ...rule, count: rule.count === null ? null : rule.count - 1 }
   // One transaction: the new task is written only if this call moved the rule off the finished one.
@@ -323,7 +327,9 @@ tasks.patch('/tasks/:id{[0-9]+}', async (c) => {
   if ('repeat' in f && f.repeat !== task.repeat) await assertLead(c.env.DB, task.division_id, me)
   const set = setClause(f, false)
   // Turning a rule on starts a series, or continues the one it was stopped in.
-  if (f.repeat != null) set.sql += ', series_id = coalesce(series_id, id)'
+  if (f.repeat != null) set.sql += ', series_id = coalesce(series_id, id), repeat_ended = null'
+  // Stopping ends the repeat; its last rule is kept for the repeating view (decision 0013).
+  else if ('repeat' in f && task.repeat !== null) set.sql += ', repeat_ended = repeat'
   // A reassignment only applies over the assignee read above, so two at once can't both notify.
   const reassign = 'assigneeId' in f
   const row = await c.env.DB.prepare(
