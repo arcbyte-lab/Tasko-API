@@ -218,7 +218,7 @@ async function goneOrChanged(db: D1Database, table: 'tasks' | 'personal_tasks', 
 }
 
 /** Only a division's admins and supervisors set up repeats (arcbyte decision 0012); for a workspace task they are its reviewers. */
-async function assertLead(db: D1Database, divisionId: number, me: number) {
+export async function assertLead(db: D1Database, divisionId: number, me: number) {
   if (!(await isReviewer(db, { division_id: divisionId, project_id: null, assignee_id: null }, me))) {
     throw new HTTPException(403, { message: 'Only a division admin or supervisor can set up a repeat' })
   }
