@@ -38,12 +38,14 @@ describe('nextDue', () => {
   })
 })
 
-let mira: string
+// Mira is a plain member of tech and the assignee of task 23; Ana is tech's admin, so she sets up repeats (0012).
+let mira: string, ana: string
 beforeEach(async () => {
   mira = await login()
+  ana = await login('ana@arcbyte.dev')
 })
 
-const send = (method: string, path: string, body: unknown, token = mira) => api(token, path, { method, body: JSON.stringify(body) })
+const send = (method: string, path: string, body: unknown, token = ana) => api(token, path, { method, body: JSON.stringify(body) })
 const json = async (res: Response | Promise<Response>) => (await res).json() as Promise<any>
 const WEEKLY = { every: 1, unit: 'week', weekdays: [4, 1, 1] }
 const workspaceTasks = async () => json(api(mira, '/tabs/division/1/tasks'))
@@ -58,7 +60,7 @@ describe('a repeating workspace task', () => {
   it('is refused outside a workspace, on a sub-task, or without a due date', async () => {
     expect((await send('PATCH', '/tasks/1', { repeat: WEEKLY })).status, 'project task').toBe(422)
     expect((await send('PATCH', '/tasks/20', { repeat: WEEKLY })).status, 'sub-task').toBe(422)
-    expect((await send('PATCH', '/personal-tasks/1', { repeat: WEEKLY })).status, 'personal').toBe(422)
+    expect((await send('PATCH', '/personal-tasks/1', { repeat: WEEKLY }, mira)).status, 'personal').toBe(422)
     expect((await send('POST', '/tabs/division/1/tasks', { name: 'x', priority: 2, repeat: WEEKLY })).status, 'no due').toBe(422)
     await send('PATCH', '/tasks/23', { repeat: WEEKLY })
     expect((await send('PATCH', '/tasks/23', { dueDate: null })).status, 'clearing the due').toBe(422)
@@ -72,32 +74,61 @@ describe('a repeating workspace task', () => {
         name: 'Water plants', priority: 3, assigneeId: 1, dueDate: '2026-10-14T02:00:00Z', repeat: { every: 1, unit: 'day', count: 3 },
       }),
     )
-    const done = await json(send('PATCH', `/tasks/${created.id}/status`, { status: 'done' }))
+    const done = await json(send('PATCH', `/tasks/${created.id}/status`, { status: 'done' }, mira))
     expect(done.repeat).toBeNull()
     const next = (await workspaceTasks()).find((t: any) => t.name === 'Water plants' && t.id !== created.id)
     expect(next).toMatchObject({ status: 'waiting', priority: 3, assigneeId: 1, dueDate: '2026-10-15T02:00:00Z', code: 'TECH-0003' })
     expect(next.repeat).toMatchObject({ unit: 'day', count: 2 })
 
-    await send('PATCH', `/tasks/${created.id}/status`, { status: 'waiting' })
-    await send('PATCH', `/tasks/${created.id}/status`, { status: 'done' })
+    await send('PATCH', `/tasks/${created.id}/status`, { status: 'waiting' }, mira)
+    await send('PATCH', `/tasks/${created.id}/status`, { status: 'done' }, mira)
     expect((await workspaceTasks()).filter((t: any) => t.name === 'Water plants')).toHaveLength(2)
   })
 
   it('the last occurrence creates nothing', async () => {
     await send('PATCH', '/tasks/23', { repeat: { every: 1, unit: 'day', count: 1 } })
-    await send('PATCH', '/tasks/23/status', { status: 'done' })
+    await send('PATCH', '/tasks/23/status', { status: 'done' }, mira)
     expect((await workspaceTasks()).filter((t: any) => t.name === 'Renew SSL certificate')).toHaveLength(1)
   })
 
   it('with a proof, the next one comes when the review is approved, and keeps the proof rule', async () => {
     await env.DB.prepare("update tasks set required_proof_type = 'image' where id = 23").run()
     await send('PATCH', '/tasks/23', { repeat: { every: 1, unit: 'month' } })
-    await send('PATCH', '/tasks/23/status', { status: 'review', proofUrl: 'https://example.com/p' })
+    await send('PATCH', '/tasks/23/status', { status: 'review', proofUrl: 'https://example.com/p' }, mira)
     expect((await workspaceTasks()).filter((t: any) => t.name === 'Renew SSL certificate')).toHaveLength(1)
-    const ana = await login('ana@arcbyte.dev') // the division admin reviews it (0004)
     expect((await send('POST', '/tasks/23/reviews', { approve: true }, ana)).status).toBe(200)
     const both = (await workspaceTasks()).filter((t: any) => t.name === 'Renew SSL certificate')
     expect(both).toHaveLength(2)
     expect(both[1]).toMatchObject({ requiredProofType: 'image', status: 'waiting', repeat: { unit: 'month' } })
+  })
+})
+
+describe('repeat is set up by division leads, and occurrences share a series (0012)', () => {
+  it('a member who is not a lead gets 403 creating or changing a repeat, but can still edit the task', async () => {
+    const due = '2026-10-14T02:00:00Z'
+    expect((await send('POST', '/tabs/division/1/tasks', { name: 'x', priority: 2, dueDate: due, repeat: WEEKLY }, mira)).status).toBe(403)
+    expect((await send('PATCH', '/tasks/23', { repeat: WEEKLY }, mira)).status, 'assignee').toBe(403)
+    await send('PATCH', '/tasks/23', { repeat: WEEKLY })
+    expect((await send('PATCH', '/tasks/23', { repeat: null }, mira)).status, 'stopping it').toBe(403)
+    // The app sends the rule with every edit: unchanged, it needs no lead.
+    const same = await send('PATCH', '/tasks/23', { name: 'Renew SSL', repeat: WEEKLY }, mira)
+    expect(same.status).toBe(200)
+  })
+
+  it('a new repeating task starts its own series, and the next one keeps it', async () => {
+    const created = await json(
+      send('POST', '/tabs/division/1/tasks', { name: 'Backup check', priority: 2, assigneeId: 1, dueDate: '2026-10-14T02:00:00Z', repeat: WEEKLY }),
+    )
+    expect(created.seriesId).toBe(created.id)
+    await send('PATCH', `/tasks/${created.id}/status`, { status: 'done' }, mira)
+    const next = (await workspaceTasks()).find((t: any) => t.name === 'Backup check' && t.id !== created.id)
+    expect(next.seriesId).toBe(created.id)
+    expect((await workspaceTasks()).find((t: any) => t.name === 'Renew SSL certificate').seriesId, 'no repeat, no series').toBeNull()
+  })
+
+  it('turning a rule off and on again keeps the series', async () => {
+    expect((await json(send('PATCH', '/tasks/23', { repeat: WEEKLY }))).seriesId).toBe(23)
+    expect((await json(send('PATCH', '/tasks/23', { repeat: null }))).seriesId).toBe(23)
+    expect((await json(send('PATCH', '/tasks/23', { repeat: WEEKLY }))).seriesId).toBe(23)
   })
 })

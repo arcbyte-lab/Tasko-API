@@ -167,23 +167,23 @@ async function ownPersonalTask(c: Context<AppEnv>) {
  */
 function insertTeamTask(
   db: D1Database,
-  t: TeamTask & { parent_id: number | null; creator_id: number; required_proof_type?: string | null },
+  t: TeamTask & { parent_id: number | null; creator_id: number; required_proof_type?: string | null; series_id?: number | null },
   f: Fields,
   where = '',
 ) {
   return db
     .prepare(
       `insert into tasks (code, division_id, project_id, parent_id, creator_id, assignee_id, name, description, priority_level, due_date,
-         required_proof_type, repeat, created_at, updated_at)
+         required_proof_type, repeat, series_id, created_at, updated_at)
        select d.prefix || '-' || printf('%04d', 1 + coalesce(
            (select max(cast(substr(x.code, length(d.prefix) + 2) as integer)) from tasks x where substr(x.code, 1, length(d.prefix) + 1) = d.prefix || '-'), 0)),
-         d.id, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, datetime('now'), datetime('now')
+         d.id, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, datetime('now'), datetime('now')
        from divisions d where d.id = ?1${where}
        returning ${TEAM_TASK_COLUMNS}`,
     )
     .bind(
       t.division_id, t.project_id, t.parent_id, t.creator_id, t.assignee_id, f.name, f.description ?? null, f.priority ?? 2, f.dueDate ?? null,
-      t.required_proof_type ?? null, f.repeat ?? null,
+      t.required_proof_type ?? null, f.repeat ?? null, t.series_id ?? null,
     )
 }
 
@@ -217,6 +217,13 @@ async function goneOrChanged(db: D1Database, table: 'tasks' | 'personal_tasks', 
   return gone ? new HTTPException(404, { message: 'No such task' }) : changedMeanwhile()
 }
 
+/** Only a division's admins and supervisors set up repeats (arcbyte decision 0012); for a workspace task they are its reviewers. */
+async function assertLead(db: D1Database, divisionId: number, me: number) {
+  if (!(await isReviewer(db, { division_id: divisionId, project_id: null, assignee_id: null }, me))) {
+    throw new HTTPException(403, { message: 'Only a division admin or supervisor can set up a repeat' })
+  }
+}
+
 /** Only a workspace's own top-level tasks repeat (arcbyte decision 0009), and only from a due date. */
 function assertCanRepeat(kind: 'private' | 'division' | 'project', parentId: number | null, due: string | null | undefined) {
   if (kind !== 'division' || parentId !== null) throw new HTTPException(422, { message: 'Only a workspace task can repeat' })
@@ -230,6 +237,7 @@ type Finished = TeamTask & {
   due_date: string | null
   required_proof_type: string | null
   repeat: string | null
+  series_id: number
 }
 
 /**
@@ -241,7 +249,9 @@ type Finished = TeamTask & {
  */
 async function createNextOccurrence(db: D1Database, id: number, me: number) {
   const done = await db
-    .prepare('select division_id, project_id, assignee_id, name, description, priority_level, due_date, required_proof_type, repeat from tasks where id = ?')
+    .prepare(
+      'select division_id, project_id, assignee_id, name, description, priority_level, due_date, required_proof_type, repeat, coalesce(series_id, id) series_id from tasks where id = ?',
+    )
     .bind(id)
     .first<Finished>()
   if (!done?.repeat || !done.due_date) return false
@@ -274,6 +284,7 @@ tasks.post('/tabs/:kind{private|division|project}/:id{[0-9]+}/tasks', async (c) 
   await assertMember(c.env.DB, kind, id, me)
   const f = await readFields(c, ['name', 'priority'])
   if (f.repeat != null) assertCanRepeat(kind, null, f.dueDate)
+  if (f.repeat != null) await assertLead(c.env.DB, id, me)
   if (kind === 'private') {
     if (f.assigneeId != null) throw noAssignee()
     return c.json(toTask((await insertPersonalTask(c.env.DB, me, null, f))!), 201)
@@ -282,7 +293,13 @@ tasks.post('/tabs/:kind{private|division|project}/:id{[0-9]+}/tasks', async (c) 
   const division_id =
     kind === 'division' ? id : (await c.env.DB.prepare('select division_id from projects where id = ?').bind(id).first<number>('division_id'))!
   const project_id = kind === 'project' ? id : null
-  const row = (await insertTeamTask(c.env.DB, { division_id, project_id, parent_id: null, creator_id: me, assignee_id: f.assigneeId ?? null }, f).first<TaskRow>())!
+  const insert = insertTeamTask(c.env.DB, { division_id, project_id, parent_id: null, creator_id: me, assignee_id: f.assigneeId ?? null }, f)
+  // A repeating task starts its own series; one transaction, so it never exists without one.
+  let row: TaskRow
+  if (f.repeat) {
+    const [inserted] = await c.env.DB.batch<TaskRow>([insert, c.env.DB.prepare('update tasks set series_id = id where id = last_insert_rowid()')])
+    row = { ...inserted.results[0], series_id: inserted.results[0].id }
+  } else row = (await insert.first<TaskRow>())!
   if (row.assignee_id !== null) await notify(c.env.DB, [row.assignee_id], 'task_assigned', { taskId: row.id, taskName: row.name, actorId: me })
   return c.json(toTask(row), 201)
 })
@@ -302,7 +319,11 @@ tasks.patch('/tasks/:id{[0-9]+}', async (c) => {
   if (('repeat' in f ? f.repeat : task.repeat) != null) {
     assertCanRepeat(tab.kind, task.parent_id, 'dueDate' in f ? f.dueDate : task.due_date)
   }
+  // The app sends the rule with every edit, so only a change needs a lead.
+  if ('repeat' in f && f.repeat !== task.repeat) await assertLead(c.env.DB, task.division_id, me)
   const set = setClause(f, false)
+  // Turning a rule on starts a series, or continues the one it was stopped in.
+  if (f.repeat != null) set.sql += ', series_id = coalesce(series_id, id)'
   // A reassignment only applies over the assignee read above, so two at once can't both notify.
   const reassign = 'assigneeId' in f
   const row = await c.env.DB.prepare(

@@ -28,6 +28,7 @@ export type TaskRow = {
   parent_id: number | null
   completed_at: string | null
   repeat: string | null
+  series_id: number | null
 }
 
 /** One `Task` shape for both tables, named as in the app's models.dart. */
@@ -45,12 +46,13 @@ export const toTask = (r: TaskRow) => ({
   parentId: r.parent_id,
   completedAt: iso(r.completed_at),
   repeat: r.repeat === null ? null : JSON.parse(r.repeat),
+  seriesId: r.series_id,
 })
 
 export const TEAM_TASK_COLUMNS = `id, name, status, priority_level, due_date, description, assignee_id, required_proof_type,
-  0 personal, code, parent_id, completed_date completed_at, repeat`
+  0 personal, code, parent_id, completed_date completed_at, repeat, series_id`
 export const PERSONAL_TASK_COLUMNS = `id, title name, status, priority_level, due_date, note description, null assignee_id,
-  null required_proof_type, 1 personal, null code, parent_id, completed_at, null repeat`
+  null required_proof_type, 1 personal, null code, parent_id, completed_at, null repeat, null series_id`
 
 // The tabs the viewer (?1) sees. GET /tabs and assertMember share these, so a hidden tab can't be opened by id.
 const VISIBLE_DIVISION = `d.deleted_at is null
