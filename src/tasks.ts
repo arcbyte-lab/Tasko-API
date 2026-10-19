@@ -466,6 +466,7 @@ tasks.get('/tasks/:id{[0-9]+}/detail', async (c) => {
   const me = c.get('user').id
   const task = await teamTask(c)
   const tab = tabOf(task)
+  const repeatable = tab.kind === 'division' && task.parent_id === null
   const [tabRow, subtasks, comments, assignee, reviewer, proof] = await Promise.all([
     c.env.DB.prepare(`select name from ${tab.kind === 'project' ? 'projects' : 'divisions'} where id = ?`).bind(tab.id).first<string>('name'),
     c.env.DB.prepare(`select ${TEAM_TASK_COLUMNS} from tasks where parent_id = ? order by created_at, id`).bind(c.req.param('id')).all<TaskRow>(),
@@ -476,8 +477,8 @@ tasks.get('/tasks/:id{[0-9]+}/detail', async (c) => {
       .bind(c.req.param('id'))
       .all<{ id: number; name: string; body: string; created_at: string }>(),
     task.assignee_id === null ? null : c.env.DB.prepare('select id, name from users where id = ?').bind(task.assignee_id).first(),
-    // Only the review and extension flags read it, so skip the query when neither can be true.
-    task.status === 'review' || task.assignee_id === me ? isReviewer(c.env.DB, task, me) : false,
+    // Only the review, extension and repeat flags read it, so skip the query when none can be true.
+    task.status === 'review' || task.assignee_id === me || repeatable ? isReviewer(c.env.DB, task, me) : false,
     c.env.DB.prepare(
       `select p.file url, u.id, u.name, p.created_at from proofs p join users u on u.id = p.user_id
        where p.task_id = ? order by p.created_at desc, p.id desc limit 1`,
@@ -496,6 +497,8 @@ tasks.get('/tasks/:id{[0-9]+}/detail', async (c) => {
     canArchive: task.creator_id === me,
     // Only open tasks can be overdue (decision 0004).
     canRequestExtension: task.assignee_id === me && !reviewer && (task.status === 'waiting' || task.status === 'in_progress'),
+    // A workspace task's reviewers are its division's leads, who set up repeats (decision 0012).
+    canRepeat: repeatable && reviewer,
   })
 })
 
@@ -513,6 +516,7 @@ tasks.get('/personal-tasks/:id{[0-9]+}/detail', async (c) => {
     canReview: false,
     canArchive: false,
     canRequestExtension: false,
+    canRepeat: false,
   })
 })
 

@@ -64,3 +64,21 @@ repeating.get('/series/:id{[0-9]+}', async (c) => {
   await assertLead(c.env.DB, results[0].division_id, me)
   return c.json(results.map((r) => ({ task: toTask(r), ...result(r), proofUrl: r.proof_url })))
 })
+
+/**
+ * Deletes a series' open task, and with it the rule, only while nobody has
+ * started it. Finished occurrences stay. A started one can only be stopped
+ * (`PATCH /tasks/:id {repeat: null}`).
+ */
+repeating.delete('/series/:id{[0-9]+}', async (c) => {
+  const open = await c.env.DB.prepare('select id, division_id from tasks where series_id = ? and repeat is not null')
+    .bind(c.req.param('id'))
+    .first<{ id: number; division_id: number }>()
+  if (!open) throw new HTTPException(404, { message: 'No such repeating task' })
+  const me = c.get('user').id
+  await assertMember(c.env.DB, 'division', open.division_id, me)
+  await assertLead(c.env.DB, open.division_id, me)
+  const { meta } = await c.env.DB.prepare("delete from tasks where id = ? and status = 'waiting'").bind(open.id).run()
+  if (!meta.changes) throw new HTTPException(409, { message: 'Already started — stop repeating instead' })
+  return c.body(null, 204)
+})

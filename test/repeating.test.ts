@@ -60,3 +60,25 @@ describe('the repeating view (0012)', () => {
     expect(history[1]).toMatchObject({ task: { id }, onTime: true, finishedAt: '2025-12-31T00:00:00Z', proofUrl: 'https://example.com/report' })
   })
 })
+
+describe('deleting a repeating task (0012)', () => {
+  it('deletes the open task while it is waiting; finished ones stay', async () => {
+    const first = await repeatingTask('Backup check', '2030-01-07T02:00:00Z')
+    await tick(first)
+    expect((await api(mira, `/series/${first}`, { method: 'DELETE' })).status, 'not a lead').toBe(403)
+    expect((await api(ana, `/series/${first}`, { method: 'DELETE' })).status).toBe(204)
+    expect(await live('Backup check')).toBeUndefined()
+    const history = await json(api(ana, `/series/${first}`))
+    expect(history.map((o: any) => o.task.id)).toEqual([first])
+    expect((await api(ana, `/series/${first}`, { method: 'DELETE' })).status, 'nothing left to delete').toBe(404)
+  })
+
+  it('refuses once the open task is started or in review', async () => {
+    for (const status of ['in_progress', 'review']) {
+      const id = await repeatingTask(`Report ${status}`, '2030-01-07T02:00:00Z')
+      await env.DB.prepare('update tasks set status = ? where id = ?').bind(status, id).run()
+      expect((await api(ana, `/series/${id}`, { method: 'DELETE' })).status, status).toBe(409)
+      expect(await live(`Report ${status}`), status).toBeDefined()
+    }
+  })
+})
