@@ -15,6 +15,15 @@ const flags = async (path: string, token = mira) => {
 const setStatus = (id: number, status: string) => env.DB.prepare('update tasks set status = ? where id = ?').bind(status, id).run()
 
 describe('team task detail', () => {
+  it('says only a division lead can repeat a workspace task (0012)', async () => {
+    const ana = await login('ana@arcbyte.dev')
+    expect((await detail('/tasks/23')).canRepeat, 'Mira is a plain member of tech').toBe(false)
+    expect((await detail('/tasks/23', ana)).canRepeat, "Ana is tech's admin").toBe(true)
+    expect((await detail('/tasks/2', ana)).canRepeat, 'a project task').toBe(false)
+    expect((await detail('/tasks/20', ana)).canRepeat, 'a sub-task').toBe(false)
+    expect((await detail('/personal-tasks/1')).canRepeat).toBe(false)
+  })
+
   it('has its tab, sub-tasks by creation, live comments and assignee', async () => {
     await env.DB.prepare("insert into comments (task_id, user_id, comment, created_at, deleted_at) values (5, 4, 'gone', datetime('now'), datetime('now'))").run()
     const d = await detail('/tasks/5')
