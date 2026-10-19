@@ -4,6 +4,7 @@ import { tabs } from './tabs'
 import { tasks } from './tasks'
 import { notifications } from './notifications'
 import { projects } from './projects'
+import { repeating } from './repeating'
 
 const app = new Hono<AppEnv>()
 
@@ -30,5 +31,6 @@ app.route('/tabs', tabs)
 app.route('/', tasks)
 app.route('/notifications', notifications)
 app.route('/projects', projects)
+app.route('/', repeating)
 
 export default app
