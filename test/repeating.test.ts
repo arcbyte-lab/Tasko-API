@@ -41,11 +41,31 @@ describe('the repeating view (0012)', () => {
     ])
   })
 
-  it('drops a series once it stops repeating', async () => {
+  it('keeps a stopped series, ended, with its rule and history (0013)', async () => {
     const id = await repeatingTask('Backup check', '2030-01-07T02:00:00Z')
-    expect(await live('Backup check')).toBeDefined()
+    expect(await live('Backup check')).toMatchObject({ ended: false, rule: { unit: 'week' } })
     await send('PATCH', `/tasks/${id}`, { repeat: null })
-    expect(await live('Backup check')).toBeUndefined()
+    expect(await live('Backup check')).toMatchObject({ ended: true, rule: { unit: 'week' }, task: { repeat: null } })
+    expect(await json(api(ana, `/series/${id}`))).toHaveLength(1)
+    await send('PATCH', `/tasks/${id}`, { repeat: WEEKLY })
+    expect((await live('Backup check')).ended, 'on again, same series').toBe(false)
+  })
+
+  it('a repeat that runs out ends, instead of looking live (0013)', async () => {
+    const id = (await json(
+      send('POST', '/tabs/division/1/tasks', { name: 'Once', priority: 2, assigneeId: 1, dueDate: '2030-01-07T02:00:00Z', repeat: { ...WEEKLY, count: 1 } }),
+    )).id
+    await tick(id)
+    expect(await live('Once')).toMatchObject({ ended: true, rule: { count: 1 }, task: { status: 'done', repeat: null } })
+  })
+
+  it('lists live series first, soonest due, then ended ones', async () => {
+    const stopped = await repeatingTask('Stopped', '2030-03-04T02:00:00Z')
+    await send('PATCH', `/tasks/${stopped}`, { repeat: null })
+    await repeatingTask('Later', '2030-02-04T02:00:00Z')
+    await repeatingTask('Sooner', '2030-01-07T02:00:00Z')
+    const names = (await json(api(ana, '/divisions/1/repeating'))).map((s: any) => s.task.name)
+    expect(names).toEqual(['Sooner', 'Later', 'Stopped'])
   })
 
   it('history: every occurrence newest first; a proof task counts from when it was sent for review', async () => {
@@ -62,15 +82,31 @@ describe('the repeating view (0012)', () => {
 })
 
 describe('deleting a repeating task (0012)', () => {
-  it('deletes the open task while it is waiting; finished ones stay', async () => {
+  const inTab = async (name: string) =>
+    (await json(api(ana, '/tabs/division/1/tasks'))).filter((t: any) => t.name === name)
+
+  it('deletes a waiting open task and the series; finished tasks stay in the tab (0013)', async () => {
     const first = await repeatingTask('Backup check', '2030-01-07T02:00:00Z')
     await tick(first)
     expect((await api(mira, `/series/${first}`, { method: 'DELETE' })).status, 'not a lead').toBe(403)
     expect((await api(ana, `/series/${first}`, { method: 'DELETE' })).status).toBe(204)
     expect(await live('Backup check')).toBeUndefined()
-    const history = await json(api(ana, `/series/${first}`))
-    expect(history.map((o: any) => o.task.id)).toEqual([first])
+    expect((await api(ana, `/series/${first}`)).status, 'history gone').toBe(404)
+    expect(await inTab('Backup check')).toMatchObject([{ id: first, status: 'done', seriesId: null }])
     expect((await api(ana, `/series/${first}`, { method: 'DELETE' })).status, 'nothing left to delete').toBe(404)
+  })
+
+  it('deletes an ended series, keeping its tasks', async () => {
+    const first = await repeatingTask('Backup check', '2030-01-07T02:00:00Z')
+    await tick(first)
+    const open = (await live('Backup check')).task.id
+    await send('PATCH', `/tasks/${open}`, { repeat: null })
+    expect((await api(ana, `/series/${first}`, { method: 'DELETE' })).status).toBe(204)
+    expect(await live('Backup check')).toBeUndefined()
+    expect((await inTab('Backup check')).map((t: any) => [t.id, t.seriesId])).toEqual([
+      [first, null],
+      [open, null],
+    ])
   })
 
   it('refuses once the open task is started or in review', async () => {
