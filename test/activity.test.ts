@@ -141,3 +141,109 @@ it('private tasks write nothing', async () => {
   await send('POST', `/personal-tasks/${task.id}/subtasks`, { name: 'Buy flowers' }, mira)
   expect(await logs()).toEqual([])
 })
+
+describe('status and reviews', () => {
+  it('start, done and reopen, each with the move; acting on your own task has no target', async () => {
+    for (const status of ['inProgress', 'done', 'waiting']) await send('PATCH', '/tasks/2/status', { status }, mira)
+    expect((await logs()).map((r) => [r.action, r.target_user_id, r.changes.status])).toEqual([
+      ['task.started', null, ['waiting', 'in_progress']],
+      ['task.completed', null, ['in_progress', 'done']],
+      ['task.reopened', null, ['done', 'waiting']],
+    ])
+  })
+
+  it('sent to review, with the proof link', async () => {
+    await env.DB.prepare("update tasks set required_proof_type = 'file' where id = 1").run()
+    await send('PATCH', '/tasks/1/status', { status: 'review', proofUrl: 'https://drive.example/ci.png' }, mira)
+    expect(await logs()).toMatchObject([{ action: 'task.sent_to_review', changes: { status: ['in_progress', 'review'], proofUrl: 'https://drive.example/ci.png' } }])
+  })
+
+  it('a refused move writes nothing', async () => {
+    expect((await send('PATCH', '/tasks/4/status', { status: 'inProgress' }, mira)).status).toBe(422)
+    expect(await logs()).toEqual([])
+  })
+
+  it('approve and reject target the assignee; the losing second decision writes nothing', async () => {
+    await send('POST', '/tasks/7/reviews', { approve: false, reason: ' blurry ' }, mira)
+    await send('POST', '/tasks/12/reviews', { approve: true })
+    expect((await send('POST', '/tasks/12/reviews', { approve: true }, mira)).status).toBe(409)
+    expect((await logs()).map((r) => [r.action, r.actor_id, r.target_user_id, r.changes])).toEqual([
+      ['task.rejected', 1, 3, { status: ['review', 'in_progress'], reason: 'blurry' }],
+      ['task.approved', 2, 1, { status: ['review', 'done'] }],
+    ])
+  })
+})
+
+describe('repeats', () => {
+  it('finishing a repeating task logs the next one, on the new task, for its assignee', async () => {
+    await send('PATCH', '/tasks/23', { repeat: WEEKLY })
+    await send('PATCH', '/tasks/23/status', { status: 'done' }, mira)
+    const next = (await env.DB.prepare('select id from tasks where series_id = 23 and id != 23').first<number>('id'))!
+    const rows = await logs()
+    expect(rows.map((r) => r.action)).toEqual(['repeat.set', 'task.completed', 'repeat.next_created'])
+    expect(rows[2]).toMatchObject({ actor_id: 1, subject_id: next, subject_label: 'Renew SSL certificate', target_user_id: null })
+    expect(rows[2].changes.fromTaskId).toBe(23)
+  })
+
+  it('approved by a lead: the lead is the actor and the assignee the target', async () => {
+    await env.DB.prepare("update tasks set required_proof_type = 'file' where id = 23").run()
+    await send('PATCH', '/tasks/23', { repeat: WEEKLY })
+    await send('PATCH', '/tasks/23/status', { status: 'review', proofUrl: 'https://drive.example/ssl.png' }, mira)
+    await send('POST', '/tasks/23/reviews', { approve: true })
+    expect((await logs()).at(-1)).toMatchObject({ action: 'repeat.next_created', actor_id: 2, target_user_id: 1 })
+  })
+
+  it('deleting a series logs it; a refused delete writes nothing', async () => {
+    await send('PATCH', '/tasks/23', { repeat: WEEKLY })
+    await send('PATCH', '/tasks/23/status', { status: 'inProgress' }, mira)
+    expect((await send('DELETE', '/series/23', null)).status).toBe(409)
+    expect((await logs()).map((r) => r.action)).toEqual(['repeat.set', 'task.started'])
+    await send('PATCH', '/tasks/23/status', { status: 'done' }, mira)
+    expect((await send('DELETE', '/series/23', null)).status).toBe(204)
+    expect((await logs()).at(-1)).toMatchObject({ action: 'series.deleted', subject_type: 'series', subject_id: 23, subject_label: 'Renew SSL certificate', division_id: 1 })
+  })
+})
+
+describe('projects and members', () => {
+  it('a new project is the subject and the project of its row', async () => {
+    const project = await json(send('POST', '/projects', { divisionId: 1, name: 'Stock Opname Q4', dueDate: '2026-12-20' }))
+    expect(await logs()).toEqual([
+      {
+        actor_id: 2, actor_name: 'Ana', action: 'project.created', subject_type: 'project', subject_id: project.id, subject_label: 'Stock Opname Q4',
+        division_id: 1, project_id: project.id, target_user_id: null, changes: { dueDate: '2026-12-20' },
+      },
+    ])
+  })
+
+  it('added, given a role, and a no-op role change writes nothing', async () => {
+    await env.DB.prepare("insert into users (id, name, email, password) values (8, 'Gita', 'gita@arcbyte.dev', '!')").run()
+    await send('POST', '/projects/2/members', { userId: 8 }, mira)
+    expect((await send('POST', '/projects/2/members', { userId: 8 }, mira)).status).toBe(409)
+    await send('PATCH', '/projects/2/members/3', { role: 'person-in-charge' }, mira)
+    await send('PATCH', '/projects/2/members/3', { role: 'person-in-charge' }, mira)
+    expect((await logs()).map((r) => [r.action, r.subject_type, r.subject_label, r.project_id, r.target_user_id, r.changes])).toEqual([
+      ['member.added', 'member', 'Gita', 2, 8, { role: 'member' }],
+      ['member.role_changed', 'member', 'Budi', 2, 3, { role: ['member', 'person-in-charge'] }],
+    ])
+  })
+
+  it('removed: the row lists the unassigned tasks, and each task logs its own unassign', async () => {
+    const { results } = await env.DB.prepare(
+      "select id from tasks where project_id = 1 and assignee_id = 1 and status in ('todo', 'waiting', 'in_progress') order by id",
+    ).all<{ id: number }>()
+    const ids = results.map((r) => r.id)
+    expect(ids.length).toBeGreaterThan(0)
+    await send('DELETE', '/projects/1/members/1', null)
+    const [member, ...tasks] = await logs()
+    expect(member).toMatchObject({ action: 'member.removed', actor_id: 2, target_user_id: 1, changes: { role: 'member', unassignedTaskIds: ids } })
+    expect(tasks.map((r) => [r.action, r.subject_id, r.target_user_id])).toEqual(ids.map((id) => ['task.unassigned', id, 1]))
+  })
+
+  it('leaving is member.left with no target; a refused leave writes nothing', async () => {
+    await send('DELETE', '/projects/1/members/3', null, await login('budi@arcbyte.dev'))
+    expect((await logs())[0]).toMatchObject({ action: 'member.left', actor_id: 3, target_user_id: null })
+    await env.DB.prepare('delete from activity_logs').run()
+    expect((await send('DELETE', '/projects/2/members/1', null, mira)).status).toBe(422)
+    expect(await logs()).toEqual([])
+  })
+})

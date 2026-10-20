@@ -1,6 +1,6 @@
 import { Hono, type Context } from 'hono'
 import { HTTPException } from 'hono/http-exception'
-import { logRow } from './activity'
+import { JUST_INSERTED, logRow } from './activity'
 import type { AppEnv } from './auth'
 import { notify } from './notifications'
 import { nextDue, readRepeat, type Repeat } from './repeat'
@@ -15,6 +15,9 @@ const DB_STATUS: Record<string, string> = Object.fromEntries(Object.entries(STAT
  * working" moves an untouched task to in progress (decision 0008); the
  * checkbox itself never does.
  */
+/** The log action for a move to each status (arcbyte decision 0014); `waiting` is only reached by reopening. */
+const MOVED: Record<string, string> = { in_progress: 'task.started', done: 'task.completed', review: 'task.sent_to_review', waiting: 'task.reopened' }
+
 function teamMove(from: string, to: string, needsReview: boolean): string | null {
   const open = from === 'waiting' || from === 'in_progress'
   if (from === 'waiting' && to === 'in_progress') return "start_date = coalesce(start_date, datetime('now'))"
@@ -235,6 +238,8 @@ function assertCanRepeat(kind: 'private' | 'division' | 'project', parentId: num
   if (due == null) throw new HTTPException(422, { message: 'A repeating task needs a due date' })
 }
 
+type Actor = { id: number; name: string }
+
 type Finished = TeamTask & {
   name: string
   description: string | null
@@ -252,7 +257,7 @@ type Finished = TeamTask & {
  * ticking again never makes a second one. Sub-tasks, comments and proofs stay
  * with the finished task. Returns whether a next one was created.
  */
-async function createNextOccurrence(db: D1Database, id: number, me: number) {
+async function createNextOccurrence(db: D1Database, id: number, actor: Actor) {
   const done = await db
     .prepare(
       'select division_id, project_id, assignee_id, name, description, priority_level, due_date, required_proof_type, repeat, coalesce(series_id, id) series_id from tasks where id = ?',
@@ -269,22 +274,30 @@ async function createNextOccurrence(db: D1Database, id: number, me: number) {
   }
   const keep = done.assignee_id !== null && (await isAssignable(db, 'division', done.division_id, done.assignee_id))
   const next = { ...rule, count: rule.count === null ? null : rule.count - 1 }
-  // One transaction: the new task is written only if this call moved the rule off the finished one.
+  const assignee = keep ? done.assignee_id : null
+  // One transaction: the new task, and its log row, are written only if this call moved the rule off the finished one.
   const [, inserted] = await db.batch<TaskRow>([
     db.prepare('update tasks set repeat = null where id = ? and repeat = ?').bind(id, done.repeat),
     insertTeamTask(
       db,
-      { ...done, parent_id: null, creator_id: me, assignee_id: keep ? done.assignee_id : null },
+      { ...done, parent_id: null, creator_id: actor.id, assignee_id: assignee },
       { name: done.name, description: done.description, priority: done.priority_level, dueDate: due, repeat: JSON.stringify(next) },
       ' and changes() = 1',
     ),
+    logRow(
+      db,
+      {
+        actor, action: 'repeat.next_created', subject: { type: 'task', id: JUST_INSERTED, label: done.name },
+        divisionId: done.division_id, projectId: null, targetUserId: assignee, changes: { fromTaskId: id, dueDate: iso(due) },
+      },
+      true,
+    ),
   ])
   const row = inserted.results[0]
-  if (row?.assignee_id != null) await notify(db, [row.assignee_id], 'task_assigned', { taskId: row.id, taskName: row.name, actorId: me })
+  if (row?.assignee_id != null) await notify(db, [row.assignee_id], 'task_assigned', { taskId: row.id, taskName: row.name, actorId: actor.id })
   return !!row
 }
 
-type Actor = { id: number; name: string }
 type Stored = Awaited<ReturnType<typeof teamTask>>
 
 const parseRule = (rule: string | null | undefined) => (rule == null ? null : JSON.parse(rule))
@@ -350,7 +363,7 @@ tasks.post('/tabs/:kind{private|division|project}/:id{[0-9]+}/tasks', async (c) 
   const log = logRow(
     c.env.DB,
     {
-      actor: c.get('user'), action: 'task.created', subject: { type: 'task', id: null, label: f.name! },
+      actor: c.get('user'), action: 'task.created', subject: { type: 'task', id: JUST_INSERTED, label: f.name! },
       divisionId: division_id, projectId: project_id, targetUserId: f.assigneeId, changes: { ...f, repeat: parseRule(f.repeat) },
     },
     true,
@@ -476,20 +489,30 @@ tasks.patch('/tasks/:id{[0-9]+}/status', async (c) => {
   const also = teamMove(task.status, to, task.required_proof_type !== null)
   if (also === null) throw notAllowed(task.status, to)
   const proof = to === 'review' ? proofLink(body.proofUrl) : null
+  const log = logRow(
+    c.env.DB,
+    {
+      actor: c.get('user'), action: MOVED[to], subject: { type: 'task', id: task.id, label: task.name },
+      divisionId: task.division_id, projectId: task.project_id, targetUserId: task.assignee_id,
+      changes: { status: [task.status, to], ...(proof === null ? {} : { proofUrl: proof }) },
+    },
+    true,
+  )
   const update = c.env.DB.prepare(
     `update tasks set status = ?1, ${also ? also + ', ' : ''}updated_at = datetime('now')
      where id = ?2 and status = ?3 returning ${TEAM_TASK_COLUMNS}`,
   ).bind(to, c.req.param('id'), task.status)
-  // With a proof, one transaction: the proof row is written only if the status moved.
+  // With a proof, one transaction: the proof row is written only if the status moved, and the log row only if both were.
   const [updated] = await c.env.DB.batch<TaskRow>(
     proof === null
-      ? [update]
+      ? [update, log]
       : [
           update,
           c.env.DB.prepare(
             `insert into proofs (task_id, user_id, file, created_at, updated_at)
              select ?, ?, ?, datetime('now'), datetime('now') where changes() = 1`,
           ).bind(c.req.param('id'), me, proof),
+          log,
         ],
   )
   const row = updated.results[0]
@@ -497,7 +520,7 @@ tasks.patch('/tasks/:id{[0-9]+}/status', async (c) => {
   if (to === 'review') {
     await notify(c.env.DB, await reviewersOf(c.env.DB, task), 'task_review_requested', { taskId: row.id, taskName: row.name, actorId: me })
   }
-  if (to === 'done' && (await createNextOccurrence(c.env.DB, row.id, me))) row.repeat = null
+  if (to === 'done' && (await createNextOccurrence(c.env.DB, row.id, c.get('user')))) row.repeat = null
   return c.json(toTask(row))
 })
 
@@ -634,13 +657,22 @@ tasks.post('/tasks/:id{[0-9]+}/reviews', async (c) => {
       `insert into task_reviews (task_id, reviewer_id, decision, reason, created_at, updated_at)
        select ?, ?, ?, ?, datetime('now'), datetime('now') where changes() = 1`,
     ).bind(id, me, approve ? 'approved' : 'rejected', reason?.trim() || null),
+    logRow(
+      c.env.DB,
+      {
+        actor: c.get('user'), action: approve ? 'task.approved' : 'task.rejected', subject: { type: 'task', id: task.id, label: task.name },
+        divisionId: task.division_id, projectId: task.project_id, targetUserId: task.assignee_id,
+        changes: { status: ['review', approve ? 'done' : 'in_progress'], ...(reason?.trim() ? { reason: reason.trim() } : {}) },
+      },
+      true,
+    ),
   ])
   const row = updated.results[0]
   if (!row) throw new HTTPException(409, { message: 'This task is not waiting for review' })
   if (row.assignee_id !== null) {
     await notify(c.env.DB, [row.assignee_id], 'task_reviewed', { taskId: row.id, taskName: row.name, actorId: me, approved: approve })
   }
-  if (approve && (await createNextOccurrence(c.env.DB, row.id, me))) row.repeat = null
+  if (approve && (await createNextOccurrence(c.env.DB, row.id, c.get('user')))) row.repeat = null
   return c.json(toTask(row))
 })
 
