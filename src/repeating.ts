@@ -1,5 +1,6 @@
 import { Hono } from 'hono'
 import { HTTPException } from 'hono/http-exception'
+import { logRow } from './activity'
 import type { AppEnv } from './auth'
 import { assertMember, iso, TEAM_TASK_COLUMNS, toTask, type TaskRow } from './tabs'
 import { assertLead } from './tasks'
@@ -85,10 +86,10 @@ repeating.get('/series/:id{[0-9]+}', async (c) => {
 repeating.delete('/series/:id{[0-9]+}', async (c) => {
   const id = c.req.param('id')
   const head = await c.env.DB.prepare(
-    'select id, division_id, status, repeat from tasks where series_id = ? and (repeat is not null or repeat_ended is not null)',
+    'select id, name, division_id, status, repeat from tasks where series_id = ? and (repeat is not null or repeat_ended is not null)',
   )
     .bind(id)
-    .first<{ id: number; division_id: number; status: string; repeat: string | null }>()
+    .first<{ id: number; name: string; division_id: number; status: string; repeat: string | null }>()
   if (!head) throw new HTTPException(404, { message: 'No such repeating task' })
   const me = c.get('user').id
   await assertMember(c.env.DB, 'division', head.division_id, me)
@@ -100,8 +101,15 @@ repeating.delete('/series/:id{[0-9]+}', async (c) => {
   const unlink = c.env.DB.prepare(
     'update tasks set series_id = null, repeat_ended = null where series_id = ?1 and not exists (select 1 from tasks where id = ?2 and repeat is not null)',
   ).bind(id, head.id)
+  const log = (guarded: boolean) =>
+    logRow(
+      c.env.DB,
+      { actor: c.get('user'), action: 'series.deleted', subject: { type: 'series', id: Number(id), label: head.name }, divisionId: head.division_id, projectId: null },
+      guarded,
+    )
+  // A live one logs only if its open task was deleted; the unlink can change many rows, so it isn't the guard.
   const [deleted] = await c.env.DB.batch(
-    live ? [c.env.DB.prepare("delete from tasks where id = ? and status = 'waiting'").bind(head.id), unlink] : [unlink],
+    live ? [c.env.DB.prepare("delete from tasks where id = ? and status = 'waiting'").bind(head.id), log(true), unlink] : [unlink, log(false)],
   )
   if (live && !deleted.meta.changes) throw new HTTPException(409, { message: 'Already started — stop repeating instead' })
   return c.body(null, 204)

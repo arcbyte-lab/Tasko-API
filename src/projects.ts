@@ -1,5 +1,6 @@
 import { Hono, type Context } from 'hono'
 import { HTTPException } from 'hono/http-exception'
+import { logRow, type NewId } from './activity'
 import type { AppEnv } from './auth'
 import { notify } from './notifications'
 import { assertMember } from './tabs'
@@ -30,6 +31,23 @@ async function viewer(c: Context<AppEnv>) {
   await assertMember(c.env.DB, 'project', id, me)
   return { id, me, myRole: await roleIn(c.env.DB, id, me) }
 }
+
+/** The project the batch just created, read back through its owner's member row, the last insert. */
+const JUST_CREATED: NewId = { sql: '(select project_id from project_members where rowid = last_insert_rowid())' }
+
+const projectOf = (db: D1Database, id: number) =>
+  db.prepare('select name, division_id from projects where id = ?').bind(id).first<{ name: string; division_id: number }>()
+
+/** A guarded `member.*` log row for [user] in [project] (arcbyte decision 0014). */
+const memberLog = (c: Context<AppEnv>, project: { id: number; division_id: number }, action: string, user: { id: number; name: string }, changes: Record<string, unknown>) =>
+  logRow(
+    c.env.DB,
+    {
+      actor: c.get('user'), action, subject: { type: 'member', id: user.id, label: user.name },
+      divisionId: project.division_id, projectId: project.id, targetUserId: user.id, changes,
+    },
+    true,
+  )
 
 export const projects = new Hono<AppEnv>()
 
@@ -64,6 +82,14 @@ projects.post('/', async (c) => {
       `insert into project_members (project_id, user_id, role, invited_by, created_at, updated_at)
        values (last_insert_rowid(), ?, 'owner', null, datetime('now'), datetime('now'))`,
     ).bind(me),
+    logRow(
+      c.env.DB,
+      {
+        actor: c.get('user'), action: 'project.created', subject: { type: 'project', id: JUST_CREATED, label: name.trim() },
+        divisionId: divisionId as number, projectId: JUST_CREATED, changes: { dueDate: dueDate == null ? null : (dueDate as string).slice(0, 10) },
+      },
+      true,
+    ),
   ])
   return c.json({ kind: 'project', ...project.results[0], role: 'owner' }, 201)
 })
@@ -80,16 +106,17 @@ projects.post('/:id{[0-9]+}/members', async (c) => {
   const user = await c.env.DB.prepare('select id, name, is_active from users where id = ?').bind(body.userId).first<{ id: number; name: string; is_active: number }>()
   if (!user) throw new HTTPException(404, { message: 'No such user' })
   if (!user.is_active) throw new HTTPException(422, { message: 'That user is not active' })
-  const { meta } = await c.env.DB.prepare(
-    `insert or ignore into project_members (project_id, user_id, role, invited_by, created_at, updated_at)
-     values (?, ?, ?, ?, datetime('now'), datetime('now'))`,
-  )
-    .bind(id, user.id, role, me)
-    .run()
+  const project = (await projectOf(c.env.DB, id))!
+  const [{ meta }] = await c.env.DB.batch([
+    c.env.DB.prepare(
+      `insert or ignore into project_members (project_id, user_id, role, invited_by, created_at, updated_at)
+       values (?, ?, ?, ?, datetime('now'), datetime('now'))`,
+    ).bind(id, user.id, role, me),
+    memberLog(c, { ...project, id }, 'member.added', user, { role }),
+  ])
   if (!meta.changes) throw new HTTPException(409, { message: 'Already a member' })
 
-  const projectName = (await c.env.DB.prepare('select name from projects where id = ?').bind(id).first<string>('name'))!
-  await notify(c.env.DB, [user.id], 'project_member_added', { projectId: id, projectName, actorId: me })
+  await notify(c.env.DB, [user.id], 'project_member_added', { projectId: id, projectName: project.name, actorId: me })
   return c.json({ user: { id: user.id, name: user.name }, role }, 201)
 })
 
@@ -102,15 +129,17 @@ projects.patch('/:id{[0-9]+}/members/:userId{[0-9]+}', async (c) => {
   if (current === null) throw notMember()
   if ((role === 'owner' || current === 'owner') && myRole !== 'owner') throw ownersOnly()
 
+  const name = (await c.env.DB.prepare('select name from users where id = ?').bind(userId).first<string>('name'))!
+  const project = (await projectOf(c.env.DB, id))!
   // The owner count is checked in the update itself, so two owners demoting each other can't both win.
-  const { meta } = await c.env.DB.prepare(
-    `update project_members set role = ?3, updated_at = datetime('now')
-     where project_id = ?1 and user_id = ?2 and (?3 = 'owner' or ${KEEPS_AN_OWNER})`,
-  )
-    .bind(id, userId, role)
-    .run()
+  const [{ meta }] = await c.env.DB.batch([
+    c.env.DB.prepare(
+      `update project_members set role = ?3, updated_at = datetime('now')
+       where project_id = ?1 and user_id = ?2 and (?3 = 'owner' or ${KEEPS_AN_OWNER})`,
+    ).bind(id, userId, role),
+    ...(role === current ? [] : [memberLog(c, { ...project, id }, 'member.role_changed', { id: userId, name }, { role: [current, role] })]),
+  ])
   if (!meta.changes) throw needsOwner()
-  const name = await c.env.DB.prepare('select name from users where id = ?').bind(userId).first<string>('name')
   return c.json({ user: { id: userId, name }, role })
 })
 
@@ -128,8 +157,29 @@ projects.delete('/:id{[0-9]+}/members/:userId{[0-9]+}', async (c) => {
   if (current === null) throw notMember()
   if (!self && current === 'owner' && myRole !== 'owner') throw ownersOnly()
 
+  const name = (await c.env.DB.prepare('select name from users where id = ?').bind(userId).first<string>('name'))!
+  const project = { ...(await projectOf(c.env.DB, id))!, id }
+  // ponytail: read before the batch, so a task assigned to them meanwhile is unassigned but not logged.
+  const { results: open } = await c.env.DB.prepare(
+    `select id, name from tasks where project_id = ? and assignee_id = ? and status in ('todo', 'waiting', 'in_progress')`,
+  )
+    .bind(id, userId)
+    .all<{ id: number; name: string }>()
+  const unassigned = open.map((t) =>
+    logRow(
+      c.env.DB,
+      {
+        actor: c.get('user'), action: 'task.unassigned', subject: { type: 'task', id: t.id, label: t.name },
+        divisionId: project.division_id, projectId: id, targetUserId: userId, changes: { assigneeId: [userId, null], assigneeName: name },
+      },
+      true,
+    ),
+  )
   const [removed] = await c.env.DB.batch([
     c.env.DB.prepare(`delete from project_members where project_id = ?1 and user_id = ?2 and ${KEEPS_AN_OWNER}`).bind(id, userId),
+    // The log rows follow the delete; then the unassign.
+    memberLog(c, project, self ? 'member.left' : 'member.removed', { id: userId, name }, { role: current, unassignedTaskIds: open.map((t) => t.id) }),
+    ...unassigned,
     // Runs only if the delete did: the guard sees the row gone.
     c.env.DB.prepare(
       `update tasks set assignee_id = null, updated_at = datetime('now')
