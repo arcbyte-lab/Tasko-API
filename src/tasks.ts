@@ -1,5 +1,6 @@
 import { Hono, type Context } from 'hono'
 import { HTTPException } from 'hono/http-exception'
+import { logRow } from './activity'
 import type { AppEnv } from './auth'
 import { notify } from './notifications'
 import { nextDue, readRepeat, type Repeat } from './repeat'
@@ -133,11 +134,15 @@ const tabOf = (t: TeamTask) =>
 /** A team task in one of the viewer's tabs: 404 if missing, 403 if outside them. */
 async function teamTask(c: Context<AppEnv>) {
   const task = await c.env.DB.prepare(
-    'select division_id, project_id, parent_id, assignee_id, creator_id, status, required_proof_type, due_date, repeat from tasks where id = ?',
+    'select id, name, description, priority_level, division_id, project_id, parent_id, assignee_id, creator_id, status, required_proof_type, due_date, repeat from tasks where id = ?',
   )
     .bind(c.req.param('id'))
     .first<
       TeamTask & {
+        id: number
+        name: string
+        description: string | null
+        priority_level: number
         parent_id: number | null
         creator_id: number
         status: string
@@ -279,6 +284,50 @@ async function createNextOccurrence(db: D1Database, id: number, me: number) {
   return !!row
 }
 
+type Actor = { id: number; name: string }
+type Stored = Awaited<ReturnType<typeof teamTask>>
+
+const parseRule = (rule: string | null | undefined) => (rule == null ? null : JSON.parse(rule))
+
+/** The plain fields an edit logs, each as its own row: field, action, stored column. */
+const EDITS = [
+  ['name', 'task.renamed', 'name'],
+  ['description', 'task.description_changed', 'description'],
+  ['priority', 'task.priority_changed', 'priority_level'],
+  ['dueDate', 'task.due_changed', 'due_date'],
+] as const
+
+/**
+ * One guarded log row per field [f] changes on [task] (arcbyte decision 0014),
+ * to follow the update in its batch. A reassignment logs both people: the old
+ * assignee's unassign and the new one's assign.
+ */
+async function editLogs(db: D1Database, task: Stored, f: Fields, actor: Actor) {
+  const row = (action: string, changes: Record<string, unknown>, targetUserId: number | null = null) =>
+    logRow(
+      db,
+      { actor, action, subject: { type: 'task', id: task.id, label: f.name ?? task.name }, divisionId: task.division_id, projectId: task.project_id, targetUserId, changes },
+      true,
+    )
+  const rows = []
+  for (const [key, action, column] of EDITS) {
+    if (!(key in f) || f[key] === task[column]) continue
+    const [before, after] = key === 'dueDate' ? [iso(task.due_date), iso(f.dueDate ?? null)] : [task[column], f[key]]
+    rows.push(row(action, { [key]: [before, after] }))
+  }
+  if ('assigneeId' in f && f.assigneeId !== task.assignee_id) {
+    const change = [task.assignee_id, f.assigneeId]
+    const nameOf = (id: number) => db.prepare('select name from users where id = ?').bind(id).first<string>('name')
+    if (task.assignee_id !== null) rows.push(row('task.unassigned', { assigneeId: change, assigneeName: await nameOf(task.assignee_id) }, task.assignee_id))
+    if (f.assigneeId != null) rows.push(row('task.assigned', { assigneeId: change, assigneeName: await nameOf(f.assigneeId) }, f.assigneeId))
+  }
+  if ('repeat' in f && f.repeat !== task.repeat) {
+    const action = task.repeat === null ? 'repeat.set' : f.repeat === null ? 'repeat.stopped' : 'repeat.changed'
+    rows.push(row(action, { repeat: [parseRule(task.repeat), parseRule(f.repeat)] }))
+  }
+  return rows
+}
+
 export const tasks = new Hono<AppEnv>()
 
 tasks.post('/tabs/:kind{private|division|project}/:id{[0-9]+}/tasks', async (c) => {
@@ -298,12 +347,19 @@ tasks.post('/tabs/:kind{private|division|project}/:id{[0-9]+}/tasks', async (c) 
     kind === 'division' ? id : (await c.env.DB.prepare('select division_id from projects where id = ?').bind(id).first<number>('division_id'))!
   const project_id = kind === 'project' ? id : null
   const insert = insertTeamTask(c.env.DB, { division_id, project_id, parent_id: null, creator_id: me, assignee_id: f.assigneeId ?? null }, f)
-  // A repeating task starts its own series; one transaction, so it never exists without one.
-  let row: TaskRow
-  if (f.repeat) {
-    const [inserted] = await c.env.DB.batch<TaskRow>([insert, c.env.DB.prepare('update tasks set series_id = id where id = last_insert_rowid()')])
-    row = { ...inserted.results[0], series_id: inserted.results[0].id }
-  } else row = (await insert.first<TaskRow>())!
+  const log = logRow(
+    c.env.DB,
+    {
+      actor: c.get('user'), action: 'task.created', subject: { type: 'task', id: null, label: f.name! },
+      divisionId: division_id, projectId: project_id, targetUserId: f.assigneeId, changes: { ...f, repeat: parseRule(f.repeat) },
+    },
+    true,
+  )
+  // A repeating task starts its own series; one transaction, so it never exists without one, or without its log row.
+  const [inserted] = await c.env.DB.batch<TaskRow>(
+    f.repeat ? [insert, c.env.DB.prepare('update tasks set series_id = id where id = last_insert_rowid()'), log] : [insert, log],
+  )
+  const row: TaskRow = f.repeat ? { ...inserted.results[0], series_id: inserted.results[0].id } : inserted.results[0]
   if (row.assignee_id !== null) await notify(c.env.DB, [row.assignee_id], 'task_assigned', { taskId: row.id, taskName: row.name, actorId: me })
   return c.json(toTask(row), 201)
 })
@@ -332,11 +388,12 @@ tasks.patch('/tasks/:id{[0-9]+}', async (c) => {
   else if ('repeat' in f && task.repeat !== null) set.sql += ', repeat_ended = repeat'
   // A reassignment only applies over the assignee read above, so two at once can't both notify.
   const reassign = 'assigneeId' in f
-  const row = await c.env.DB.prepare(
+  const update = c.env.DB.prepare(
     `update tasks set ${set.sql} where id = ?${reassign ? ' and assignee_id is ?' : ''} returning ${TEAM_TASK_COLUMNS}`,
-  )
-    .bind(...set.values, c.req.param('id'), ...(reassign ? [task.assignee_id] : []))
-    .first<TaskRow>()
+  ).bind(...set.values, c.req.param('id'), ...(reassign ? [task.assignee_id] : []))
+  // ponytail: other fields' "before" is the read above, not the row updated; a concurrent edit can make it stale.
+  const [updated] = await c.env.DB.batch<TaskRow>([update, ...(await editLogs(c.env.DB, task, f, c.get('user')))])
+  const row = updated.results[0]
   if (!row) throw changedMeanwhile()
   if (row.assignee_id !== null && row.assignee_id !== task.assignee_id) {
     await notify(c.env.DB, [row.assignee_id], 'task_assigned', { taskId: row.id, taskName: row.name, actorId: c.get('user').id })
@@ -372,17 +429,29 @@ tasks.post('/tasks/:id{[0-9]+}/subtasks', async (c) => {
   const { name } = await readFields(c, ['name'])
   const tab = tabOf(parent)
   const keep = parent.assignee_id !== null && (await isAssignable(c.env.DB, tab.kind, tab.id, parent.assignee_id))
-  const row = await insertTeamTask(
-    c.env.DB,
-    {
-      division_id: parent.division_id,
-      project_id: parent.project_id,
-      assignee_id: keep ? parent.assignee_id : null,
-      parent_id: Number(c.req.param('id')),
-      creator_id: c.get('user').id,
-    },
-    { name },
-  ).first<TaskRow>()
+  const [inserted] = await c.env.DB.batch<TaskRow>([
+    insertTeamTask(
+      c.env.DB,
+      {
+        division_id: parent.division_id,
+        project_id: parent.project_id,
+        assignee_id: keep ? parent.assignee_id : null,
+        parent_id: parent.id,
+        creator_id: c.get('user').id,
+      },
+      { name },
+    ),
+    // A sub-task's log is its parent's.
+    logRow(
+      c.env.DB,
+      {
+        actor: c.get('user'), action: 'subtask.added', subject: { type: 'task', id: parent.id, label: parent.name },
+        divisionId: parent.division_id, projectId: parent.project_id, changes: { subtask: name },
+      },
+      true,
+    ),
+  ])
+  const row = inserted.results[0]
   const me = c.get('user').id
   if (row!.assignee_id !== null) await notify(c.env.DB, [row!.assignee_id], 'task_assigned', { taskId: row!.id, taskName: row!.name, actorId: me })
   return c.json(toTask(row!), 201)
@@ -527,15 +596,20 @@ tasks.get('/personal-tasks/:id{[0-9]+}/detail', async (c) => {
 })
 
 tasks.post('/tasks/:id{[0-9]+}/comments', async (c) => {
-  await teamTask(c)
+  const task = await teamTask(c)
   const { body } = await readBody(c)
   if (typeof body !== 'string' || !body.trim()) throw bad('body must be a non-empty string')
   const user = c.get('user')
-  const createdAt = await c.env.DB.prepare(
-    `insert into comments (task_id, user_id, comment, created_at, updated_at) values (?, ?, ?, datetime('now'), datetime('now')) returning created_at`,
-  )
-    .bind(c.req.param('id'), user.id, body.trim())
-    .first<string>('created_at')
+  const [inserted] = await c.env.DB.batch<{ created_at: string }>([
+    c.env.DB.prepare(
+      `insert into comments (task_id, user_id, comment, created_at, updated_at) values (?, ?, ?, datetime('now'), datetime('now')) returning created_at`,
+    ).bind(task.id, user.id, body.trim()),
+    logRow(c.env.DB, {
+      actor: user, action: 'comment.added', subject: { type: 'task', id: task.id, label: task.name },
+      divisionId: task.division_id, projectId: task.project_id, targetUserId: task.assignee_id, changes: { body: body.trim() },
+    }),
+  ])
+  const createdAt = inserted.results[0].created_at
   return c.json({ author: { id: user.id, name: user.name }, body: body.trim(), createdAt: iso(createdAt!) }, 201)
 })
 
@@ -585,13 +659,21 @@ tasks.post('/tasks/:id{[0-9]+}/deadline-requests', async (c) => {
     throw new HTTPException(422, { message: 'newDue must be later than the current due date' })
   }
   // One pending request per task; the guard is in the insert so a double tap can't add a second.
-  const { meta } = await c.env.DB.prepare(
-    `insert into task_deadline_requests (task_id, requester_id, current_due_date, requested_due_date, reason, status, created_at, updated_at)
-     select id, ?2, due_date, ?3, ?4, 'pending', datetime('now'), datetime('now') from tasks
-     where id = ?1 and not exists (select 1 from task_deadline_requests where task_id = ?1 and status = 'pending')`,
-  )
-    .bind(c.req.param('id'), me, newDue, body.reason.trim())
-    .run()
+  const [{ meta }] = await c.env.DB.batch([
+    c.env.DB.prepare(
+      `insert into task_deadline_requests (task_id, requester_id, current_due_date, requested_due_date, reason, status, created_at, updated_at)
+       select id, ?2, due_date, ?3, ?4, 'pending', datetime('now'), datetime('now') from tasks
+       where id = ?1 and not exists (select 1 from task_deadline_requests where task_id = ?1 and status = 'pending')`,
+    ).bind(task.id, me, newDue, body.reason.trim()),
+    logRow(
+      c.env.DB,
+      {
+        actor: c.get('user'), action: 'deadline.requested', subject: { type: 'task', id: task.id, label: task.name },
+        divisionId: task.division_id, projectId: task.project_id, changes: { dueDate: [iso(task.due_date), iso(newDue)], reason: body.reason.trim() },
+      },
+      true,
+    ),
+  ])
   if (!meta.changes) {
     const gone = !(await c.env.DB.prepare('select 1 from tasks where id = ?').bind(c.req.param('id')).first())
     throw gone ? new HTTPException(404, { message: 'No such task' }) : new HTTPException(409, { message: 'A request for this task is already pending' })
