@@ -1,6 +1,6 @@
 import { Hono, type Context } from 'hono'
 import { HTTPException } from 'hono/http-exception'
-import { JUST_INSERTED, logRow } from './activity'
+import { JUST_INSERTED, logRow, opensLog } from './activity'
 import type { AppEnv } from './auth'
 import { notify } from './notifications'
 import { nextDue, readRepeat, type Repeat } from './repeat'
@@ -131,11 +131,11 @@ async function assertAssignable(db: D1Database, kind: 'division' | 'project', ta
 }
 
 type TeamTask = { division_id: number; project_id: number | null; assignee_id: number | null }
-const tabOf = (t: TeamTask) =>
+export const tabOf = (t: TeamTask) =>
   t.project_id ? { kind: 'project' as const, id: t.project_id } : { kind: 'division' as const, id: t.division_id }
 
 /** A team task in one of the viewer's tabs: 404 if missing, 403 if outside them. */
-async function teamTask(c: Context<AppEnv>) {
+export async function teamTask(c: Context<AppEnv>) {
   const task = await c.env.DB.prepare(
     'select id, name, description, priority_level, division_id, project_id, parent_id, assignee_id, creator_id, status, required_proof_type, due_date, repeat from tasks where id = ?',
   )
@@ -565,7 +565,7 @@ tasks.get('/tasks/:id{[0-9]+}/detail', async (c) => {
   const task = await teamTask(c)
   const tab = tabOf(task)
   const repeatable = tab.kind === 'division' && task.parent_id === null
-  const [tabRow, subtasks, comments, assignee, reviewer, proof] = await Promise.all([
+  const [tabRow, subtasks, comments, assignee, reviewer, proof, canViewLog] = await Promise.all([
     c.env.DB.prepare(`select name from ${tab.kind === 'project' ? 'projects' : 'divisions'} where id = ?`).bind(tab.id).first<string>('name'),
     c.env.DB.prepare(`select ${TEAM_TASK_COLUMNS} from tasks where parent_id = ? order by created_at, id`).bind(c.req.param('id')).all<TaskRow>(),
     c.env.DB.prepare(
@@ -583,6 +583,7 @@ tasks.get('/tasks/:id{[0-9]+}/detail', async (c) => {
     )
       .bind(c.req.param('id'))
       .first<{ url: string; id: number; name: string; created_at: string }>(),
+    opensLog(c.env.DB, tab, me),
   ])
   return c.json({
     tab: { kind: tab.kind, id: tab.id, name: tabRow },
@@ -597,6 +598,8 @@ tasks.get('/tasks/:id{[0-9]+}/detail', async (c) => {
     canRequestExtension: task.assignee_id === me && !reviewer && (task.status === 'waiting' || task.status === 'in_progress'),
     // A workspace task's reviewers are its division's leads, who set up repeats (decision 0012).
     canRepeat: repeatable && reviewer,
+    // Leads only (decision 0014): the division's admins and supervisors, or the project's owners and persons-in-charge.
+    canViewLog,
   })
 })
 
