@@ -107,3 +107,12 @@ describe('comments', () => {
     expect((await comment('/tasks/1', 'hi')).status).toBe(403)
   })
 })
+
+it('one task by id, for a log row: in your tabs only (0014)', async () => {
+  const res = await api(mira, '/tasks/1')
+  expect(res.status).toBe(200)
+  expect(await res.json()).toMatchObject({ id: 1, name: 'Set up CI', status: 'inProgress', personal: false })
+  expect((await api(mira, '/tasks/999')).status).toBe(404)
+  await env.DB.prepare('delete from project_members where project_id = 1 and user_id = 1').run()
+  expect((await api(mira, '/tasks/1')).status).toBe(403)
+})

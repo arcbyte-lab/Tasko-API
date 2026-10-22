@@ -560,6 +560,13 @@ async function reviewersOf(db: D1Database, task: TeamTask, only: number | null =
 
 const isReviewer = async (db: D1Database, task: TeamTask, userId: number) => (await reviewersOf(db, task, userId)).length > 0
 
+/** One team task, for opening it from an activity log row (arcbyte decision 0014). */
+tasks.get('/tasks/:id{[0-9]+}', async (c) => {
+  await teamTask(c)
+  const row = await c.env.DB.prepare(`select ${TEAM_TASK_COLUMNS} from tasks where id = ?`).bind(c.req.param('id')).first<TaskRow>()
+  return c.json(toTask(row!))
+})
+
 tasks.get('/tasks/:id{[0-9]+}/detail', async (c) => {
   const me = c.get('user').id
   const task = await teamTask(c)
