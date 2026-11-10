@@ -90,6 +90,20 @@ describe('archive', () => {
     expect((await send('POST', '/tasks/2/archive', {}, ana)).status).toBe(409)
   })
 
+  it('an archived task refuses every change but can still be read', async () => {
+    const ana = await login('ana@arcbyte.dev')
+    await send('POST', '/tasks/2/archive', {}, ana)
+    const refused = async (method: string, path: string, body: unknown, token = mira) => (await send(method, path, body, token)).status
+    expect(await refused('PATCH', '/tasks/2', { name: 'x' })).toBe(409)
+    expect(await refused('PATCH', '/tasks/2/status', { status: 'inProgress' })).toBe(409)
+    expect(await refused('POST', '/tasks/2/subtasks', { name: 'x' })).toBe(409)
+    expect(await refused('POST', '/tasks/2/comments', { body: 'x' })).toBe(409)
+    expect(await refused('POST', '/tasks/2/reviews', { approve: true }, ana)).toBe(409)
+    expect(await refused('POST', '/tasks/2/deadline-requests', { newDue: '2099-12-01T10:00:00Z', reason: 'x' })).toBe(409)
+    expect((await api(mira, '/tasks/2')).status, 'a log row can still open it').toBe(200)
+    expect((await api(mira, '/tasks/2/detail')).status).toBe(200)
+  })
+
   it('only the creator, and only inside the viewer’s tabs', async () => {
     expect((await send('POST', '/tasks/2/archive', {})).status, 'the assignee').toBe(403)
     expect((await send('POST', '/tasks/2/archive', {}, await login('budi@arcbyte.dev'))).status, 'a member').toBe(403)

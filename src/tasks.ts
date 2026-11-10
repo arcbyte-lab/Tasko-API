@@ -137,7 +137,7 @@ export const tabOf = (t: TeamTask) =>
 /** A team task in one of the viewer's tabs: 404 if missing, 403 if outside them. */
 export async function teamTask(c: Context<AppEnv>) {
   const task = await c.env.DB.prepare(
-    'select id, name, description, priority_level, division_id, project_id, parent_id, assignee_id, creator_id, status, required_proof_type, due_date, repeat from tasks where id = ?',
+    'select id, name, description, priority_level, division_id, project_id, parent_id, assignee_id, creator_id, status, required_proof_type, due_date, repeat, cancelled_date from tasks where id = ?',
   )
     .bind(c.req.param('id'))
     .first<
@@ -152,11 +152,23 @@ export async function teamTask(c: Context<AppEnv>) {
         required_proof_type: string | null
         due_date: string | null
         repeat: string | null
+        cancelled_date: string | null
       }
     >()
   if (!task) throw new HTTPException(404, { message: 'No such task' })
   const tab = tabOf(task)
   await assertMember(c.env.DB, tab.kind, tab.id, c.get('user').id)
+  return task
+}
+
+/**
+ * [teamTask] for a change: 409 once the task is archived, which sets
+ * `cancelled_date` (arcbyte decision 0019). Reads still work, for log rows.
+ */
+// ponytail: only the task itself is checked; a sub-task of an archived task can still change.
+async function liveTask(c: Context<AppEnv>) {
+  const task = await teamTask(c)
+  if (task.cancelled_date) throw new HTTPException(409, { message: 'This task is archived' })
   return task
 }
 
@@ -380,7 +392,7 @@ tasks.post('/tabs/:kind{private|division|project}/:id{[0-9]+}/tasks', async (c) 
 /** The assignee, the creator and the reviewers edit a team task; only the creator and reviewers reassign it. */
 tasks.patch('/tasks/:id{[0-9]+}', async (c) => {
   const me = c.get('user').id
-  const task = await teamTask(c)
+  const task = await liveTask(c)
   const lead = task.creator_id === me || (await isReviewer(c.env.DB, task, me))
   if (!lead && task.assignee_id !== me) throw new HTTPException(403, { message: 'Only the assignee, the creator or a reviewer can edit this task' })
   const f = await readFields(c, [])
@@ -441,7 +453,7 @@ async function assertTopLevel(db: D1Database, table: 'tasks' | 'personal_tasks',
 }
 
 tasks.post('/tasks/:id{[0-9]+}/subtasks', async (c) => {
-  const parent = await teamTask(c)
+  const parent = await liveTask(c)
   await assertTopLevel(c.env.DB, 'tasks', c.req.param('id'))
   const { name } = await readFields(c, ['name'])
   const tab = tabOf(parent)
@@ -485,7 +497,7 @@ tasks.patch('/tasks/:id{[0-9]+}/status', async (c) => {
   const me = c.get('user').id
   const { to, body } = await newStatus(c)
   // Only in a tab the viewer can see; then the assignee ticks it, or anyone if it's unassigned.
-  const task = await teamTask(c)
+  const task = await liveTask(c)
   if (task.assignee_id !== null && task.assignee_id !== me) {
     throw new HTTPException(403, { message: 'Only the assignee can change this task' })
   }
@@ -661,7 +673,7 @@ tasks.post('/tasks/:id{[0-9]+}/archive', async (c) => {
 })
 
 tasks.post('/tasks/:id{[0-9]+}/comments', async (c) => {
-  const task = await teamTask(c)
+  const task = await liveTask(c)
   const { body } = await readBody(c)
   if (typeof body !== 'string' || !body.trim()) throw bad('body must be a non-empty string')
   const user = c.get('user')
@@ -681,7 +693,7 @@ tasks.post('/tasks/:id{[0-9]+}/comments', async (c) => {
 /** Approve → done, reject → back to in progress (decision 0004). The first decision wins (decision 0005). */
 tasks.post('/tasks/:id{[0-9]+}/reviews', async (c) => {
   const me = c.get('user').id
-  const task = await teamTask(c)
+  const task = await liveTask(c)
   if (!(await isReviewer(c.env.DB, task, me))) throw new HTTPException(403, { message: 'Only a reviewer can decide this task' })
   const { approve, reason } = await readBody(c)
   if (typeof approve !== 'boolean') throw bad('approve must be true or false')
@@ -720,7 +732,7 @@ tasks.post('/tasks/:id{[0-9]+}/reviews', async (c) => {
 
 tasks.post('/tasks/:id{[0-9]+}/deadline-requests', async (c) => {
   const me = c.get('user').id
-  const task = await teamTask(c)
+  const task = await liveTask(c)
   if (task.assignee_id !== me || (await isReviewer(c.env.DB, task, me))) {
     throw new HTTPException(403, { message: 'Only the assignee, when not a reviewer, can ask for more time' })
   }
