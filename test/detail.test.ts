@@ -42,6 +42,15 @@ describe('team task detail', () => {
     const d = await detail('/tasks/12')
     expect(d.proof).toMatchObject({ url: 'https://drive.google.com/file/d/qa-checkout-flow-report/view', author: { id: 1, name: 'Mira' } })
     expect(d.proof.createdAt).toMatch(/Z$/)
+    expect(d.proofs).toEqual([d.proof])
+  })
+
+  it('lists every proof, newest first, after a rejection and a second try', async () => {
+    await env.DB.prepare("insert into proofs (task_id, user_id, file, created_at, updated_at) values (12, 1, 'https://example.com/second', datetime('now', '+1 minute'), datetime('now'))").run()
+    const d = await detail('/tasks/12')
+    expect(d.proofs.map((p: any) => p.url)).toEqual(['https://example.com/second', 'https://drive.google.com/file/d/qa-checkout-flow-report/view'])
+    expect(d.proof.url).toBe('https://example.com/second')
+    expect((await detail('/tasks/5')).proofs).toEqual([])
   })
 
   it('on tasko-web, where Mira is the author, she reviews and never asks for an extension', async () => {
