@@ -22,6 +22,7 @@ export type TaskRow = {
   due_date: string | null
   description: string | null
   assignee_id: number | null
+  creator_id: number
   required_proof_type: string | null
   personal: number
   code: string | null
@@ -40,6 +41,7 @@ export const toTask = (r: TaskRow) => ({
   dueDate: iso(r.due_date),
   description: r.description,
   assigneeId: r.assignee_id,
+  creatorId: r.creator_id,
   requiredProofType: r.required_proof_type,
   personal: r.personal === 1,
   code: r.code,
@@ -49,9 +51,9 @@ export const toTask = (r: TaskRow) => ({
   seriesId: r.series_id,
 })
 
-export const TEAM_TASK_COLUMNS = `id, name, status, priority_level, due_date, description, assignee_id, required_proof_type,
+export const TEAM_TASK_COLUMNS = `id, name, status, priority_level, due_date, description, assignee_id, creator_id, required_proof_type,
   0 personal, code, parent_id, completed_date completed_at, repeat, series_id`
-export const PERSONAL_TASK_COLUMNS = `id, title name, status, priority_level, due_date, note description, null assignee_id,
+export const PERSONAL_TASK_COLUMNS = `id, title name, status, priority_level, due_date, note description, null assignee_id, user_id creator_id,
   null required_proof_type, 1 personal, null code, parent_id, completed_at, null repeat, null series_id`
 
 // The tabs the viewer (?1) sees. GET /tabs and assertMember share these, so a hidden tab can't be opened by id.

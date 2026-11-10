@@ -15,14 +15,14 @@ describe('create', () => {
     const res = await send('POST', '/tabs/private/0/tasks', { name: ' Call mum ', priority: 3, dueDate: '2026-10-10T09:30:00.000Z' })
     expect(res.status).toBe(201)
     expect(await res.json()).toMatchObject({
-      name: 'Call mum', priority: 3, status: 'todo', personal: true, code: null, dueDate: '2026-10-10T09:30:00Z',
+      name: 'Call mum', priority: 3, status: 'todo', personal: true, code: null, creatorId: 1, dueDate: '2026-10-10T09:30:00Z',
     })
     expect((await env.DB.prepare("select user_id from personal_tasks where title = 'Call mum'").first())!.user_id).toBe(1)
   })
 
   it('in a division: a team task with the division code and no project', async () => {
     const task = await json(send('POST', '/tabs/division/1/tasks', { name: 'Rotate keys', priority: 2, assigneeId: 3 }))
-    expect(task).toMatchObject({ code: 'TECH-0002', status: 'waiting', assigneeId: 3, personal: false })
+    expect(task).toMatchObject({ code: 'TECH-0002', status: 'waiting', assigneeId: 3, creatorId: 1, personal: false })
     const row = await env.DB.prepare('select division_id, project_id, creator_id from tasks where id = ?').bind(task.id).first()
     expect(row).toEqual({ division_id: 1, project_id: null, creator_id: 1 })
   })
