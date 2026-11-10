@@ -57,9 +57,9 @@ export const PERSONAL_TASK_COLUMNS = `id, title name, status, priority_level, du
   null required_proof_type, 1 personal, null code, parent_id, completed_at, null repeat, null series_id`
 
 // The tabs the viewer (?1) sees. GET /tabs and assertMember share these, so a hidden tab can't be opened by id.
-const VISIBLE_DIVISION = `d.deleted_at is null
+export const VISIBLE_DIVISION = `d.deleted_at is null
   and exists (select 1 from division_members m where m.division_id = d.id and m.user_id = ?1)`
-const VISIBLE_PROJECT = `p.status != 'archived'
+export const VISIBLE_PROJECT = `p.status != 'archived'
   and exists (select 1 from divisions d where d.id = p.division_id and d.deleted_at is null)
   and exists (select 1 from project_members m where m.project_id = p.id and m.user_id = ?1)` // membership is the member tables alone (0002)
 

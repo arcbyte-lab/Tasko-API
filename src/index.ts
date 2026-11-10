@@ -6,6 +6,7 @@ import { notifications } from './notifications'
 import { projects } from './projects'
 import { repeating } from './repeating'
 import { logs } from './logs'
+import { discussions } from './discussions'
 
 const app = new Hono<AppEnv>()
 
@@ -34,5 +35,6 @@ app.route('/notifications', notifications)
 app.route('/projects', projects)
 app.route('/', repeating)
 app.route('/', logs)
+app.route('/', discussions)
 
 export default app
