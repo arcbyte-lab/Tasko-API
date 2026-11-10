@@ -79,6 +79,24 @@ describe('create', () => {
   })
 })
 
+describe('archive', () => {
+  it('the creator archives: the task leaves its tab, gets a date and a log row; a second time is 409', async () => {
+    const ana = await login('ana@arcbyte.dev') // task 2's creator
+    const before = (await json(api(ana, '/tabs/project/1/tasks'))).length
+    expect((await send('POST', '/tasks/2/archive', {}, ana)).status).toBe(204)
+    expect((await env.DB.prepare('select cancelled_date c from tasks where id = 2').first())!.c).not.toBeNull()
+    expect((await json(api(ana, '/tabs/project/1/tasks'))).length).toBe(before - 1)
+    expect(await env.DB.prepare("select count(*) n from activity_logs where action = 'task.archived' and subject_id = 2").first('n')).toBe(1)
+    expect((await send('POST', '/tasks/2/archive', {}, ana)).status).toBe(409)
+  })
+
+  it('only the creator, and only inside the viewer’s tabs', async () => {
+    expect((await send('POST', '/tasks/2/archive', {})).status, 'the assignee').toBe(403)
+    expect((await send('POST', '/tasks/2/archive', {}, await login('budi@arcbyte.dev'))).status, 'a member').toBe(403)
+    expect((await send('POST', '/tasks/9999/archive', {})).status).toBe(404)
+  })
+})
+
 describe('update', () => {
   it('changes only the fields sent', async () => {
     const ana = await login('ana@arcbyte.dev') // task 2's creator

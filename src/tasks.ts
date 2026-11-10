@@ -631,6 +631,26 @@ tasks.get('/personal-tasks/:id{[0-9]+}/detail', async (c) => {
   })
 })
 
+/** Archiving sets `cancelled_date` (arcbyte decision 0019); the tab lists then leave the task out. */
+tasks.post('/tasks/:id{[0-9]+}/archive', async (c) => {
+  const task = await teamTask(c)
+  if (task.creator_id !== c.get('user').id) throw new HTTPException(403, { message: 'Only the creator can archive this task' })
+  const log = logRow(
+    c.env.DB,
+    {
+      actor: c.get('user'), action: 'task.archived', subject: { type: 'task', id: task.id, label: task.name },
+      divisionId: task.division_id, projectId: task.project_id, targetUserId: task.assignee_id,
+    },
+    true,
+  )
+  const [update] = await c.env.DB.batch([
+    c.env.DB.prepare("update tasks set cancelled_date = datetime('now'), updated_at = datetime('now') where id = ? and cancelled_date is null").bind(task.id),
+    log,
+  ])
+  if (!update.meta.changes) throw new HTTPException(409, { message: 'This task is already archived' })
+  return c.body(null, 204)
+})
+
 tasks.post('/tasks/:id{[0-9]+}/comments', async (c) => {
   const task = await teamTask(c)
   const { body } = await readBody(c)
