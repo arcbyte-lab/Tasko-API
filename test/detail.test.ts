@@ -53,6 +53,14 @@ describe('team task detail', () => {
     expect((await detail('/tasks/5')).proofs).toEqual([])
   })
 
+  it('shows the date of a pending extension request, else null', async () => {
+    expect((await detail('/tasks/1')).pendingExtension).toBeNull()
+    await env.DB.prepare("insert into task_deadline_requests (task_id, requester_id, requested_due_date, status) values (1, 1, '2099-12-01 10:00:00', 'pending')").run()
+    expect((await detail('/tasks/1')).pendingExtension).toBe('2099-12-01T10:00:00Z')
+    await env.DB.prepare("update task_deadline_requests set status = 'approved'").run()
+    expect((await detail('/tasks/1')).pendingExtension).toBeNull()
+  })
+
   it('on tasko-web, where Mira is the author, she reviews and never asks for an extension', async () => {
     expect(await flags('/tasks/12')).toEqual({ canReview: true, canArchive: false, canRequestExtension: false })
     expect((await flags('/tasks/7')).canReview).toBe(true)

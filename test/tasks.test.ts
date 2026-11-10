@@ -99,6 +99,16 @@ describe('update', () => {
     expect((await send('PATCH', '/personal-tasks/2', { name: 'x' }, await login('ana@arcbyte.dev'))).status).toBe(404)
   })
 
+  it('an assignee can resend the due date but not change it; the creator can (0018)', async () => {
+    await env.DB.prepare("update tasks set due_date = '2099-01-01 10:00:00' where id = 2").run()
+    expect((await send('PATCH', '/tasks/2', { dueDate: '2099-01-01T10:00:00Z', name: 'same date' })).status, 'unchanged').toBe(200)
+    const res = await send('PATCH', '/tasks/2', { dueDate: '2099-02-01T10:00:00Z' })
+    expect(res.status, 'assignee moves it').toBe(403)
+    expect((await send('PATCH', '/tasks/2', { dueDate: null })).status, 'assignee clears it').toBe(403)
+    expect((await env.DB.prepare('select due_date from tasks where id = 2').first())!.due_date).toBe('2099-01-01 10:00:00')
+    expect((await send('PATCH', '/tasks/2', { dueDate: '2099-02-01T10:00:00Z' }, await login('ana@arcbyte.dev'))).status, 'creator').toBe(200)
+  })
+
   it('the assignee edits but can’t reassign; other members can’t edit; the creator and reviewers can do both', async () => {
     // Task 2 on tasko-app: assigned to Mira, created by Ana (also its person-in-charge); Budi is a plain member.
     expect((await send('PATCH', '/tasks/2', { name: 'Port tokens' })).status, 'assignee edits').toBe(200)
