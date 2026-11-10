@@ -387,6 +387,10 @@ tasks.patch('/tasks/:id{[0-9]+}', async (c) => {
   if (!lead && 'assigneeId' in f && f.assigneeId !== task.assignee_id) {
     throw new HTTPException(403, { message: 'Only the creator or a reviewer can reassign this task' })
   }
+  // The app sends the date with every edit, so only a change needs a lead (decision 0018 item 2).
+  if (!lead && 'dueDate' in f && iso(f.dueDate ?? null) !== iso(task.due_date)) {
+    throw new HTTPException(403, { message: 'Only the creator or a reviewer can change the due date; ask for an extension instead' })
+  }
   const tab = tabOf(task)
   await assertAssignable(c.env.DB, tab.kind, tab.id, f.assigneeId)
   if (('repeat' in f ? f.repeat : task.repeat) != null) {
@@ -572,7 +576,7 @@ tasks.get('/tasks/:id{[0-9]+}/detail', async (c) => {
   const task = await teamTask(c)
   const tab = tabOf(task)
   const repeatable = tab.kind === 'division' && task.parent_id === null
-  const [tabRow, subtasks, comments, assignee, reviewer, proofs, canViewLog] = await Promise.all([
+  const [tabRow, subtasks, comments, assignee, reviewer, proofs, pending, canViewLog] = await Promise.all([
     c.env.DB.prepare(`select name from ${tab.kind === 'project' ? 'projects' : 'divisions'} where id = ?`).bind(tab.id).first<string>('name'),
     c.env.DB.prepare(`select ${TEAM_TASK_COLUMNS} from tasks where parent_id = ? order by created_at, id`).bind(c.req.param('id')).all<TaskRow>(),
     c.env.DB.prepare(
@@ -590,6 +594,9 @@ tasks.get('/tasks/:id{[0-9]+}/detail', async (c) => {
     )
       .bind(c.req.param('id'))
       .all<{ url: string; id: number; name: string; created_at: string }>(),
+    c.env.DB.prepare("select requested_due_date from task_deadline_requests where task_id = ? and status = 'pending'")
+      .bind(c.req.param('id'))
+      .first<string>('requested_due_date'),
     opensLog(c.env.DB, tab, me),
   ])
   const proofList = proofs.results.map((p) => ({ url: p.url, author: { id: p.id, name: p.name }, createdAt: iso(p.created_at) }))
@@ -601,6 +608,8 @@ tasks.get('/tasks/:id{[0-9]+}/detail', async (c) => {
     // Every proof, newest first: an earlier one stays in the table after a rejection. `proof` is the newest.
     proof: proofList[0] ?? null,
     proofs: proofList,
+    // The date an assignee asked for and nobody has decided on yet, or null.
+    pendingExtension: iso(pending),
     canReview: task.status === 'review' && reviewer,
     canArchive: task.creator_id === me,
     // Only open tasks can be overdue (decision 0004).
