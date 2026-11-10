@@ -572,7 +572,7 @@ tasks.get('/tasks/:id{[0-9]+}/detail', async (c) => {
   const task = await teamTask(c)
   const tab = tabOf(task)
   const repeatable = tab.kind === 'division' && task.parent_id === null
-  const [tabRow, subtasks, comments, assignee, reviewer, proof, canViewLog] = await Promise.all([
+  const [tabRow, subtasks, comments, assignee, reviewer, proofs, canViewLog] = await Promise.all([
     c.env.DB.prepare(`select name from ${tab.kind === 'project' ? 'projects' : 'divisions'} where id = ?`).bind(tab.id).first<string>('name'),
     c.env.DB.prepare(`select ${TEAM_TASK_COLUMNS} from tasks where parent_id = ? order by created_at, id`).bind(c.req.param('id')).all<TaskRow>(),
     c.env.DB.prepare(
@@ -586,19 +586,21 @@ tasks.get('/tasks/:id{[0-9]+}/detail', async (c) => {
     task.status === 'review' || task.assignee_id === me || repeatable ? isReviewer(c.env.DB, task, me) : false,
     c.env.DB.prepare(
       `select p.file url, u.id, u.name, p.created_at from proofs p join users u on u.id = p.user_id
-       where p.task_id = ? order by p.created_at desc, p.id desc limit 1`,
+       where p.task_id = ? order by p.created_at desc, p.id desc`,
     )
       .bind(c.req.param('id'))
-      .first<{ url: string; id: number; name: string; created_at: string }>(),
+      .all<{ url: string; id: number; name: string; created_at: string }>(),
     opensLog(c.env.DB, tab, me),
   ])
+  const proofList = proofs.results.map((p) => ({ url: p.url, author: { id: p.id, name: p.name }, createdAt: iso(p.created_at) }))
   return c.json({
     tab: { kind: tab.kind, id: tab.id, name: tabRow },
     subtasks: subtasks.results.map(toTask),
     comments: comments.results.map((r) => ({ author: { id: r.id, name: r.name }, body: r.body, createdAt: iso(r.created_at) })),
     assignee,
-    // The latest proof; an earlier one stays in the table after a rejection.
-    proof: proof && { url: proof.url, author: { id: proof.id, name: proof.name }, createdAt: iso(proof.created_at) },
+    // Every proof, newest first: an earlier one stays in the table after a rejection. `proof` is the newest.
+    proof: proofList[0] ?? null,
+    proofs: proofList,
     canReview: task.status === 'review' && reviewer,
     canArchive: task.creator_id === me,
     // Only open tasks can be overdue (decision 0004).
@@ -621,6 +623,7 @@ tasks.get('/personal-tasks/:id{[0-9]+}/detail', async (c) => {
     comments: [],
     assignee: null,
     proof: null,
+    proofs: [],
     canReview: false,
     canArchive: false,
     canRequestExtension: false,
